@@ -20,6 +20,8 @@ jobs:
       - name: Fetch the runsc under test
         run: |
           . .github/bex/probe.env
+          # The checkout already has a runsc/ directory.
+          mkdir -p "$RUNNER_TEMP/bin" && cd "$RUNNER_TEMP/bin"
           curl -fsSL -o runsc "$BEX_RUNSC_URL"
           echo "$BEX_RUNSC_SHA512  runsc" | sha512sum -c -
           chmod a+rx runsc
@@ -29,5 +31,5 @@ jobs:
       - name: The runsc under test, five times
         run: |
           for i in 1 2 3 4 5; do
-            sudo ./runsc --network=none do python3 -I "$PWD/.github/bex/pty-signal-echo-probe.py"
+            sudo "$RUNNER_TEMP/bin/runsc" --network=none do python3 -I "$PWD/.github/bex/pty-signal-echo-probe.py"
           done
