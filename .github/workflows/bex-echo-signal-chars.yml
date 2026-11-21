@@ -27,12 +27,13 @@ jobs:
       - uses: actions/checkout@v5
       - name: Build runsc and containerd-shim-runsc-v1
         run: |
+          # On master, runsc runs sidecar binaries from gvisor-bin/, which
+          # //:release builds alongside runsc and the shim.
           mkdir -p bin
-          make copy TARGETS=runsc DESTINATION=bin/
-          make copy TARGETS=//shim:containerd-shim-runsc-v1 DESTINATION=bin/
+          make copy TARGETS=//:release DESTINATION=bin/
           cd bin
+          ls -R
           ./runsc --version
-          sha512sum runsc containerd-shim-runsc-v1 | tee SHA512SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: runsc-x86_64
