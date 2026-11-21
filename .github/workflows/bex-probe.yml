@@ -1,0 +1,33 @@
+# bex (w4/m545): runs bex's PTY probe under a published runsc build, without
+# building one. Push the branch with BEX_RUNSC_URL / BEX_RUNSC_SHA512 set in
+# .github/bex/probe.env, or dispatch with inputs.
+name: bex probe a runsc build
+
+"on":
+  push:
+    branches:
+      - bex-probe
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Fetch the runsc under test
+        run: |
+          . .github/bex/probe.env
+          curl -fsSL -o runsc "$BEX_RUNSC_URL"
+          echo "$BEX_RUNSC_SHA512  runsc" | sha512sum -c -
+          chmod a+rx runsc
+          ./runsc --version
+      - name: Native Linux
+        run: python3 -I .github/bex/pty-signal-echo-probe.py
+      - name: The runsc under test, five times
+        run: |
+          for i in 1 2 3 4 5; do
+            sudo ./runsc --network=none do python3 -I "$PWD/.github/bex/pty-signal-echo-probe.py"
+          done
