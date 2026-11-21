@@ -593,6 +593,9 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 	for len(buf) > 0 && len(q.readBuf) < canonMaxBytes {
 		size := l.peek(buf)
 		cBytes := append([]byte{}, buf[:size]...)
+		// crToNL is whether cBytes is a carriage return that ICRNL turned
+		// into a newline.
+		crToNL := false
 		// We're guaranteed that cBytes has at least one element.
 		switch cBytes[0] {
 		case '\r':
@@ -603,6 +606,7 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 			}
 			if l.termios.IEnabled(linux.ICRNL) {
 				cBytes[0] = '\n'
+				crToNL = true
 			}
 		case '\n':
 			if l.termios.IEnabled(linux.INLCR) {
@@ -610,23 +614,21 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 			}
 		case l.termios.ControlCharacters[linux.VINTR]: // ctrl-c
 			if l.termios.LEnabled(linux.ISIG) {
-				l.terminal.replicaKTTY.SignalForegroundProcessGroup(kernel.SignalInfoPriv(linux.SIGINT))
-				// In Linux, signal characters are consumed and not passed to
-				// the reading process. See n_tty.c:n_tty_receive_signal_char().
+				notifyEcho = l.receiveSignalChar(cBytes, linux.SIGINT) || notifyEcho
 				buf = buf[size:]
 				ret += size
 				continue
 			}
 		case l.termios.ControlCharacters[linux.VSUSP]: // ctrl-z
 			if l.termios.LEnabled(linux.ISIG) {
-				l.terminal.replicaKTTY.SignalForegroundProcessGroup(kernel.SignalInfoPriv(linux.SIGTSTP))
+				notifyEcho = l.receiveSignalChar(cBytes, linux.SIGTSTP) || notifyEcho
 				buf = buf[size:]
 				ret += size
 				continue
 			}
 		case l.termios.ControlCharacters[linux.VQUIT]: // ctrl-\
 			if l.termios.LEnabled(linux.ISIG) {
-				l.terminal.replicaKTTY.SignalForegroundProcessGroup(kernel.SignalInfoPriv(linux.SIGQUIT))
+				notifyEcho = l.receiveSignalChar(cBytes, linux.SIGQUIT) || notifyEcho
 				buf = buf[size:]
 				ret += size
 				continue
@@ -684,8 +686,7 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 					} else if toErase == '\t' {
 						// Not implemented
 					} else {
-						const unicodeDelete byte = 0x7f
-						isCtrl := toErase < 0x20 || toErase == unicodeDelete
+						isCtrl := isControl(toErase)
 						echoctl := l.termios.LEnabled(linux.ECHOCTL)
 
 						charsToDelete := 1
@@ -695,7 +696,7 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 								// echoctl echoes control characters as ^X, so we need to erase two characters.
 								charsToDelete = 2
 							} else {
-								// if echoctl is disabled, we don't echo control characters so we don't have to erase anything.
+								// if echoctl is disabled, control characters are echoed as is and take no column, so we don't have to erase anything.
 								charsToDelete = 0
 							}
 						}
@@ -746,7 +747,7 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 
 		// Anything written to the readBuf will have to be echoed.
 		if l.termios.LEnabled(linux.ECHO) {
-			l.outQueue.writeBytes(cBytes, l)
+			l.echoInput(cBytes, crToNL)
 			notifyEcho = true
 		}
 
@@ -763,6 +764,69 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 	}
 
 	return ret, notifyEcho
+}
+
+// receiveSignalChar handles a character that ISIG turns into sig, as
+// n_tty.c:n_tty_receive_signal_char() does: the character is not passed to the
+// reading process, the foreground process group gets sig, and with ECHO set the
+// character is echoed (as "^C" with ECHOCTL). It returns whether anything was
+// echoed.
+//
+// The echo is queued before the signal is sent, so that it reaches the
+// terminal ahead of anything the signaled process prints in response.
+//
+// +checklocksread:l.termiosMu
+// +checklocksexclude:l.outQueue.mu
+func (l *lineDiscipline) receiveSignalChar(cBytes []byte, sig linux.Signal) bool {
+	echo := l.termios.LEnabled(linux.ECHO)
+	if echo {
+		l.echoChar(cBytes)
+	}
+	l.terminal.replicaKTTY.SignalForegroundProcessGroup(kernel.SignalInfoPriv(sig))
+	return echo
+}
+
+// echoInput echoes a character that was queued for the reading process, as
+// n_tty.c:n_tty_receive_char_special() and n_tty_receive_char() do. crToNL is
+// whether the character is a carriage return that ICRNL turned into a newline.
+//
+// +checklocksread:l.termiosMu
+// +checklocksexclude:l.outQueue.mu
+func (l *lineDiscipline) echoInput(cBytes []byte, crToNL bool) {
+	c := cBytes[0]
+	switch {
+	case c == '\n' && (crToNL || l.termios.LEnabled(linux.ICANON)):
+		// A line's newline is echoed as is, never as "^J".
+		l.outQueue.writeBytes(cBytes, l)
+	case l.termios.IEnabled(linux.IXON) && c != 0 &&
+		(c == l.termios.ControlCharacters[linux.VSTART] || c == l.termios.ControlCharacters[linux.VSTOP]):
+		// With IXON, Linux consumes START and STOP as flow control
+		// (n_tty.c:n_tty_receive_char_flow_ctrl()) and never echoes them.
+	default:
+		l.echoChar(cBytes)
+	}
+}
+
+// echoChar echoes cBytes as n_tty.c:echo_char() does: with ECHOCTL, a control
+// character other than TAB is shown as '^' followed by the character with bit
+// 6 flipped ("^C" for 0x03, "^?" for DEL), and any other character is echoed
+// as is.
+//
+// +checklocksread:l.termiosMu
+// +checklocksexclude:l.outQueue.mu
+func (l *lineDiscipline) echoChar(cBytes []byte) {
+	if c := cBytes[0]; l.termios.LEnabled(linux.ECHOCTL) && isControl(c) && c != '\t' {
+		l.outQueue.writeBytes([]byte{'^', c ^ 0100}, l)
+		return
+	}
+	l.outQueue.writeBytes(cBytes, l)
+}
+
+// isControl returns whether c is a control character, as the kernel's
+// iscntrl() does.
+func isControl(c byte) bool {
+	const del = 0x7f
+	return c < 0x20 || c == del
 }
 
 // shouldDiscard returns whether c should be discarded. In canonical mode, if

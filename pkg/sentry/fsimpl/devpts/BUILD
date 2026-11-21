@@ -60,7 +60,10 @@ go_test(
     embed = [":devpts"],
     deps = [
         "//pkg/abi/linux",
+        "//pkg/context",
+        "//pkg/errors/linuxerr",
         "//pkg/sentry/contexttest",
+        "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
         "//pkg/usermem",
         "//pkg/waiter",

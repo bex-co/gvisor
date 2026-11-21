@@ -1836,6 +1836,117 @@ TEST_F(PtyTest, SimpleEcho) {
   ExpectFinished(master_);
 }
 
+// Verifies that fd reads back exactly expected, and nothing after it.
+void ExpectEcho(const FileDescriptor& fd, const std::string& expected) {
+  std::string buf(expected.size(), '\0');
+  ExpectReadable(fd, expected.size(), &buf[0]);
+  EXPECT_EQ(buf, expected);
+  ExpectFinished(fd);
+}
+
+// A character that ISIG turns into a signal by default, the signal, and how
+// it is echoed with ECHOCTL.
+struct SignalChar {
+  char input;
+  int signal;
+  const char* echo;
+};
+
+constexpr SignalChar kSignalChars[] = {
+    {ControlCharacter('C'), SIGINT, "^C"},
+    {ControlCharacter('\\'), SIGQUIT, "^\\"},
+    {ControlCharacter('Z'), SIGTSTP, "^Z"},
+};
+
+// With ECHO and ECHOCTL, as by default, a signal character is echoed as ^X
+// and is not passed to the reader. This matches
+// n_tty.c:n_tty_receive_signal_char().
+TEST_F(PtyTest, SignalCharEchoedWithECHOCTL) {
+  for (const SignalChar& sc : kSignalChars) {
+    ASSERT_THAT(WriteFd(master_.get(), &sc.input, 1),
+                SyscallSucceedsWithValue(1));
+    ExpectEcho(master_, sc.echo);
+  }
+
+  // None of the signal characters is part of the next line.
+  TestCanonicalIO("a\n", "a\n", "a\r\n");
+}
+
+// Without ECHOCTL, a signal character is echoed as is.
+TEST_F(PtyTest, SignalCharEchoedWithoutECHOCTL) {
+  struct kernel_termios t = DefaultTermios();
+  t.c_lflag &= ~ECHOCTL;
+  ASSERT_THAT(ioctl(replica_.get(), TCSETS, &t), SyscallSucceeds());
+
+  for (const SignalChar& sc : kSignalChars) {
+    ASSERT_THAT(WriteFd(master_.get(), &sc.input, 1),
+                SyscallSucceedsWithValue(1));
+    ExpectEcho(master_, std::string(1, sc.input));
+  }
+}
+
+// Without ECHO, a signal character is not echoed.
+TEST_F(PtyTest, SignalCharNotEchoedWithoutECHO) {
+  struct kernel_termios t = DefaultTermios();
+  t.c_lflag &= ~ECHO;
+  ASSERT_THAT(ioctl(replica_.get(), TCSETS, &t), SyscallSucceeds());
+
+  // The line becomes readable only after the signal character before it has
+  // been processed.
+  constexpr char kInput[] = {ControlCharacter('C'), 'a', '\n'};
+  ASSERT_THAT(WriteFd(master_.get(), kInput, sizeof(kInput)),
+              SyscallSucceedsWithValue(sizeof(kInput)));
+  char buf[3] = {};
+  ASSERT_NO_ERRNO(WaitUntilReceived(replica_.get(), 2));
+  ExpectReadable(replica_, 2, buf);
+  EXPECT_STREQ(buf, "a\n");
+  ExpectFinished(master_);
+}
+
+// With ECHOCTL, a control character in a line is echoed as ^X, except TAB and
+// the newline that ends the line, and reaches the reader unchanged.
+TEST_F(PtyTest, ControlCharEchoedWithECHOCTL) {
+  TestCanonicalIO("a\x01\x1b\tb\n", "a\x01\x1b\tb\n", "a^A^[\tb\r\n");
+}
+
+// Without ECHOCTL, a control character is echoed as is.
+TEST_F(PtyTest, ControlCharEchoedWithoutECHOCTL) {
+  struct kernel_termios t = DefaultTermios();
+  t.c_lflag &= ~ECHOCTL;
+  ASSERT_THAT(ioctl(replica_.get(), TCSETS, &t), SyscallSucceeds());
+
+  TestCanonicalIO("a\x01" "b\n", "a\x01" "b\n", "a\x01" "b\r\n");
+}
+
+// In noncanonical mode, a newline is echoed as ^J with ECHOCTL, but a
+// carriage return that ICRNL turns into a newline is echoed as a newline.
+TEST_F(PtyTest, NoncanonNewlineEchoedWithECHOCTL) {
+  DisableCanonical();
+
+  constexpr char kCR = '\r';
+  ASSERT_THAT(WriteFd(master_.get(), &kCR, 1), SyscallSucceedsWithValue(1));
+  ExpectEcho(master_, "\r\n");
+
+  constexpr char kNL = '\n';
+  ASSERT_THAT(WriteFd(master_.get(), &kNL, 1), SyscallSucceedsWithValue(1));
+  ExpectEcho(master_, "^J");
+
+  char buf[3] = {};
+  ExpectReadable(replica_, 2, buf);
+  EXPECT_STREQ(buf, "\n\n");
+  ExpectFinished(replica_);
+}
+
+// With IXON, START and STOP are flow control characters, which are never
+// echoed. (gVisor passes them to the reader, as it does not implement flow
+// control, so the reader's side is not checked.)
+TEST_F(PtyTest, FlowControlCharsNotEchoedWithIXON) {
+  constexpr char kInput[] = {ControlCharacter('S'), ControlCharacter('Q'), 'x'};
+  ASSERT_THAT(WriteFd(master_.get(), kInput, sizeof(kInput)),
+              SyscallSucceedsWithValue(sizeof(kInput)));
+  ExpectEcho(master_, "x");
+}
+
 TEST_F(PtyTest, GetWindowSize) {
   struct winsize ws;
   ASSERT_THAT(ioctl(replica_.get(), TIOCGWINSZ, &ws), SyscallSucceeds());
@@ -3123,6 +3234,64 @@ TEST_F(PtyTest, PositionalIO) {
               SyscallFailsWithErrno(ESPIPE));
   EXPECT_THAT(pwritev(replica_.get(), &iov, 1, 0),
               SyscallFailsWithErrno(ESPIPE));
+}
+
+// A signal character signals the foreground process group of the session
+// whose controlling terminal it is typed into, and is echoed.
+TEST_F(JobControlTest, SignalCharSignalsForegroundAndEchoes) {
+  int sync_pipe[2];
+  ASSERT_THAT(pipe(sync_pipe), SyscallSucceeds());
+
+  pid_t child = fork();
+  if (child == 0) {
+    close(sync_pipe[0]);
+    master_.reset();
+
+    TEST_PCHECK(setsid() >= 0);
+    TEST_PCHECK(ioctl(replica_.get(), TIOCSCTTY, 0) >= 0);
+
+    sigset_t set;
+    sigemptyset(&set);
+    for (const SignalChar& sc : kSignalChars) {
+      sigaddset(&set, sc.signal);
+    }
+    TEST_PCHECK(sigprocmask(SIG_BLOCK, &set, nullptr) == 0);
+
+    char c = 'r';
+    TEST_PCHECK(WriteFd(sync_pipe[1], &c, 1) == 1);
+
+    // Report each signal the terminal sends.
+    for (size_t i = 0; i < sizeof(kSignalChars) / sizeof(kSignalChars[0]);
+         i++) {
+      struct timespec timeout = {};
+      timeout.tv_sec = 10;
+      int sig = RetryEINTR(sigtimedwait)(&set, nullptr, &timeout);
+      TEST_PCHECK(sig > 0);
+      c = sig;
+      TEST_PCHECK(WriteFd(sync_pipe[1], &c, 1) == 1);
+    }
+    _exit(0);
+  }
+  ASSERT_GT(child, 0);
+  close(sync_pipe[1]);
+
+  char c;
+  ASSERT_THAT(ReadFd(sync_pipe[0], &c, 1), SyscallSucceedsWithValue(1));
+  EXPECT_EQ(c, 'r');
+
+  for (const SignalChar& sc : kSignalChars) {
+    ASSERT_THAT(WriteFd(master_.get(), &sc.input, 1),
+                SyscallSucceedsWithValue(1));
+    ASSERT_THAT(ReadFd(sync_pipe[0], &c, 1), SyscallSucceedsWithValue(1));
+    EXPECT_EQ(c, sc.signal);
+    ExpectEcho(master_, sc.echo);
+  }
+  close(sync_pipe[0]);
+
+  int wstatus;
+  ASSERT_THAT(waitpid(child, &wstatus, 0), SyscallSucceedsWithValue(child));
+  ASSERT_TRUE(WIFEXITED(wstatus)) << wstatus;
+  EXPECT_EQ(WEXITSTATUS(wstatus), 0);
 }
 
 }  // namespace
