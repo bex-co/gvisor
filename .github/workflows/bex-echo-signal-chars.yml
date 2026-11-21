@@ -100,7 +100,7 @@ jobs:
           mkdir -p stock
           curl -fsSL -o stock/runsc "$STOCK_URL"
           echo "$STOCK_SHA512  stock/runsc" | sha512sum -c -
-          chmod a+rx stock/runsc patched/runsc
+          chmod -R a+rx stock patched
       - name: Native Linux
         run: python3 -I .github/bex/pty-signal-echo-probe.py
       - name: Stock runsc (expected to differ)
