@@ -59,7 +59,10 @@ go_test(
     library = ":devpts",
     deps = [
         "//pkg/abi/linux",
+        "//pkg/context",
+        "//pkg/errors/linuxerr",
         "//pkg/sentry/contexttest",
+        "//pkg/sentry/kernel",
         "//pkg/usermem",
         "//pkg/waiter",
     ],
