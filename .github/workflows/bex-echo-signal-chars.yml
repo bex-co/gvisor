@@ -48,7 +48,9 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-      - run: make syscall-tests TARGETS="//test/syscalls:pty_test_native //test/syscalls:pty_test_runsc_systrap" OPTIONS=--test_output=errors
+      # The default platform's variant is systrap with directfs, as runsc
+      # runs by default (test/runner/defs.bzl).
+      - run: make syscall-tests TARGETS="//test/syscalls:pty_test_native //test/syscalls:pty_test_runsc_systrap_directfs" OPTIONS=--test_output=errors
 
   syscall-tests-without-fix:
     runs-on: ubuntu-24.04
@@ -63,11 +65,14 @@ jobs:
           git diff --stat HEAD
       - name: The new tests must fail on runsc without the fix
         run: |
-          if make syscall-tests TARGETS=//test/syscalls:pty_test_runsc_systrap \
-            OPTIONS="--test_output=errors --test_arg=--gtest_filter=*SignalChar*:*ControlChar*:*NoncanonNewline*:*FlowControlChars*"; then
-            echo "::error::the new pty tests passed without the fix"
-            exit 1
-          fi
+          set +e
+          make syscall-tests TARGETS=//test/syscalls:pty_test_runsc_systrap_directfs \
+            OPTIONS="--test_output=errors --test_arg=--gtest_filter=*SignalChar*:*ControlChar*:*NoncanonNewline*:*FlowControlChars*" 2>&1 | tee out.txt
+          set -e
+          # A build error must not pass for a test failure: the target ran,
+          # failed, and the failures are the new tests'.
+          grep -E '//test/syscalls:pty_test_runsc_systrap_directfs .*FAILED' out.txt
+          grep -E '\[  FAILED  \] (PtyTest|JobControlTest)\.(SignalChar|ControlChar|NoncanonNewline|FlowControlChars)' out.txt | sort -u
 
   probe:
     needs: build
