@@ -49,9 +49,16 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+      # Ubuntu 24.04 denies unprivileged user namespaces through AppArmor,
+      # which the rootless runsc of the syscall test runner needs.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       # The default platform's variant is systrap with directfs, as runsc
-      # runs by default (test/runner/defs.bzl).
-      - run: make syscall-tests TARGETS="//test/syscalls:pty_test_native //test/syscalls:pty_test_runsc_systrap_directfs" OPTIONS=--test_output=errors
+      # runs by default (test/runner/defs.bzl). Natively, only the new tests
+      # run: they check what Linux does; the others are upstream's.
+      - name: pty_test on runsc
+        run: make syscall-tests TARGETS=//test/syscalls:pty_test_runsc_systrap_directfs OPTIONS=--test_output=errors
+      - name: The new pty tests on native Linux
+        run: make syscall-tests TARGETS=//test/syscalls:pty_test_native OPTIONS="--test_output=errors --test_filter=*SignalChar*:*ControlChar*:*NoncanonNewline*:*FlowControlChars*"
 
   syscall-tests-without-fix:
     runs-on: ubuntu-24.04
@@ -59,6 +66,7 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 10
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Revert the line discipline fix, keep its tests
         run: |
           fix=$(git log --format=%H -1 --grep='^devpts: Echo signal characters')
@@ -68,12 +76,15 @@ jobs:
         run: |
           set +e
           make syscall-tests TARGETS=//test/syscalls:pty_test_runsc_systrap_directfs \
-            OPTIONS="--test_output=errors --test_arg=--gtest_filter=*SignalChar*:*ControlChar*:*NoncanonNewline*:*FlowControlChars*" 2>&1 | tee out.txt
+            OPTIONS="--test_output=errors --test_filter=*SignalChar*:*ControlChar*:*NoncanonNewline*:*FlowControlChars*" >out.txt 2>&1
+          status=$?
           set -e
-          # A build error must not pass for a test failure: the target ran,
-          # failed, and the failures are the new tests'.
-          grep -E '//test/syscalls:pty_test_runsc_systrap_directfs .*FAILED' out.txt
-          grep -E '\[  FAILED  \] (PtyTest|JobControlTest)\.(SignalChar|ControlChar|NoncanonNewline|FlowControlChars)' out.txt | sort -u
+          cat out.txt
+          test "$status" -ne 0
+          # A build or runner error must not pass for a test failure: the
+          # failures are the new tests'.
+          grep -E '\[  FAILED  \] (PtyTest|JobControlTest)\.(SignalChar|ControlChar|NoncanonNewline|FlowControlChars)' out.txt >failed.txt
+          sort -u failed.txt
 
   probe:
     needs: build
