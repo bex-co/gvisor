@@ -33,3 +33,18 @@ jobs:
           for i in 1 2 3 4 5; do
             sudo "$RUNNER_TEMP/bin/runsc" --network=none do python3 -I "$PWD/.github/bex/pty-signal-echo-probe.py"
           done
+
+  # bex's own check (scripts/sandbox-runsc-pty-check.sh) must fail on the
+  # sandbox pool's stock pin and pass on the patched one.
+  bex-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Stock pin (expected to fail)
+        run: |
+          if bash .github/bex/check/scripts/sandbox-runsc-pty-check.sh .github/bex/check/stock-sandbox-pool.yaml; then
+            echo "::error::bex's check passed on the stock runsc"
+            exit 1
+          fi
+      - name: Patched pin
+        run: bash .github/bex/check/scripts/sandbox-runsc-pty-check.sh .github/bex/check/patched-sandbox-pool.yaml
