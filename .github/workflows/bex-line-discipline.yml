@@ -1,0 +1,172 @@
+# bex (github.com/bex-co/bex, w4/m545 and w4/m574): builds runsc and the
+# containerd shim from this branch, runs the devpts unit test and the PTY
+# syscall tests natively and on runsc, proves each line discipline fix's tests
+# fail on runsc without that fix, and runs bex's PTY probe natively, on the
+# stock release, on bex's previous build and on the patched runsc.
+name: bex line discipline
+
+"on":
+  push:
+    branches:
+      - "bex/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The stock release bex's sandbox pool ran before w4/m545, and its digest
+  # as pinned in bex's infra/clusterapi/overlays/hetzner-caph/sandbox-pool.yaml.
+  STOCK_URL: https://storage.googleapis.com/gvisor/releases/release/20260622.0/x86_64/runsc
+  STOCK_SHA512: 6df95d09363dbd9ee5d5c889c1549b457e1783b039ff60a8f9f16f8c94c774a2ca2eef5b1c370e36b863f6b0407b53ba3c69051c6ef051253843dabf89a6de4e
+  # bex's build with only w4/m545's fix, which the pool ran before w4/m574.
+  BEX1_URL: https://github.com/bex-co/gvisor/releases/download/release-20260622.0-bex.1/runsc
+  BEX1_SHA512: 2ef20fe646fccd64ac282fd9aeeb3f6eafabdd151b1446c57c3015ab8ea0a311f9a5786c3af33855ad687e6f4edd8b4dc9cfd9be30ecad0127f25609e2854438
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build runsc and containerd-shim-runsc-v1
+        run: |
+          # On master, runsc runs sidecar binaries from gvisor-bin/, which
+          # //:release builds alongside runsc and the shim.
+          mkdir -p bin
+          make copy TARGETS=//:release DESTINATION=bin/
+          cd bin
+          ls -R
+          ./runsc --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runsc-x86_64
+          path: bin/
+
+  unit-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: make test TARGETS=//pkg/sentry/fsimpl/devpts:devpts_test OPTIONS=--test_output=errors
+
+  syscall-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      # Ubuntu 24.04 denies unprivileged user namespaces through AppArmor,
+      # which the rootless runsc of the syscall test runner needs.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # The default platform's variant is systrap with directfs, as runsc
+      # runs by default (test/runner/defs.bzl). Natively, only the new tests
+      # run: they check what Linux does; the others are upstream's.
+      - name: pty_test on runsc
+        run: make syscall-tests TARGETS=//test/syscalls:pty_test_runsc_systrap_directfs OPTIONS=--test_output=errors
+      - name: The new pty tests on native Linux
+        run: |
+          uname -a
+          make syscall-tests TARGETS=//test/syscalls:pty_test_native OPTIONS="--test_output=all --test_filter=*SignalCharEchoed*:*SignalCharNotEchoed*:*ControlCharEchoed*:*NoncanonNewline*:*FlowControlChars*:*SignalCharSignalsForeground*:*DisabledChar*:*SignalCharFlush*:*KillChar*:*EraseCharWithoutECHOE*:*LiteralNext*:*ReprintChar*:*EchoNL*:*StopChar*"
+
+  # Each fix's tests run on runsc with the line discipline as it was before
+  # that fix, and exactly the listed ones must fail. The others describe what
+  # gVisor already did.
+  syscall-tests-without-fix:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - fix: "devpts: Echo signal characters"
+            filter: "*SignalCharEchoed*:*SignalCharNotEchoed*:*ControlCharEchoed*:*NoncanonNewline*:*FlowControlChars*:*SignalCharSignalsForeground*"
+            fail: >-
+              PtyTest.SignalCharEchoedWithECHOCTL PtyTest.SignalCharEchoedWithoutECHOCTL PtyTest.ControlCharEchoedWithECHOCTL PtyTest.NoncanonNewlineEchoedWithECHOCTL PtyTest.FlowControlCharsNotEchoedWithIXON JobControlTest.SignalCharSignalsForegroundAndEchoes
+          - fix: "devpts: Never treat a disabled control character as special"
+            filter: "*DisabledChar*"
+            fail: >-
+              PtyTest.DisabledCharSignalIsOrdinary PtyTest.DisabledCharsAreOrdinary
+          - fix: "devpts: Flush input and output on a signal character"
+            filter: "*SignalCharFlush*"
+            fail: >-
+              PtyTest.SignalCharFlushesInput PtyTest.SignalCharFlushDiscardsPendingEchoes PtyTest.SignalCharFlushesNoncanonicalInput PtyTest.SignalCharFlushReportsPacketModeStatus
+          - fix: "devpts: Erase the line on VKILL"
+            filter: "*KillChar*:*EraseCharWithoutECHOE*"
+            fail: >-
+              PtyTest.KillCharErasesLine PtyTest.KillCharWithoutECHOKE PtyTest.KillCharWithoutECHOKAndECHOKE PtyTest.KillCharWithoutECHO PtyTest.KillCharOnEmptyLine PtyTest.KillCharErasesControlChars PtyTest.EraseCharWithoutECHOE
+          - fix: "devpts: Implement VLNEXT, VREPRINT and ECHONL"
+            filter: "*LiteralNext*:*ReprintChar*:*EchoNL*"
+            fail: >-
+              PtyTest.LiteralNextQueuesSignalChar PtyTest.LiteralNextAcrossWrites PtyTest.LiteralNextQueuesEraseChar PtyTest.LiteralNextNewlineDoesNotEndLine PtyTest.ReprintCharReprintsLine PtyTest.EchoNLWithoutECHO
+          - fix: "devpts: Implement IXON flow control"
+            filter: "*StopChar*"
+            fail: >-
+              PtyTest.StopCharHoldsOutput PtyTest.StopCharBlocksWriter PtyTest.StopCharHoldsEchoes PtyTest.StopCharAndStartCharAreNotRead PtyTest.StopCharReportsPacketModeStatus PtyTest.StopCharThenIXANYRestarts PtyTest.StopCharThenSignalCharRestarts PtyTest.StopCharThenClearingIXONRestarts
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 30
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Revert the fix, keep its tests
+        env:
+          FIX: ${{ matrix.fix }}
+        run: |
+          fix=$(git log --format=%H -1 --fixed-strings --grep="$FIX")
+          test -n "$fix"
+          git log -1 --format='%h %s' "$fix"
+          git checkout "$fix~1" -- pkg/sentry/fsimpl/devpts/line_discipline.go pkg/abi/linux/tty.go
+          git diff --stat HEAD
+      - name: Exactly the listed tests fail on runsc without the fix
+        env:
+          FILTER: ${{ matrix.filter }}
+          FAIL: ${{ matrix.fail }}
+        run: |
+          set +e
+          make syscall-tests TARGETS=//test/syscalls:pty_test_runsc_systrap_directfs \
+            OPTIONS="--test_output=all --test_filter=$FILTER" >out.txt 2>&1
+          status=$?
+          set -e
+          cat out.txt
+          test "$status" -ne 0
+          # A build or runner error must not pass for a test failure.
+          grep -oE '\[  FAILED  \] [A-Za-z]+\.[A-Za-z]+' out.txt | awk '{print $NF}' | sort -u >failed.txt
+          grep -oE '\[       OK \] [A-Za-z]+\.[A-Za-z]+' out.txt | awk '{print $NF}' | sort -u >passed.txt
+          echo "$FAIL" | tr ' ' '\n' | sort -u >expected.txt
+          echo "Failed without the fix:"; cat failed.txt
+          echo "Passed without the fix:"; cat passed.txt
+          diff expected.txt failed.txt
+
+  probe:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: runsc-x86_64
+          path: patched
+      - name: Fetch the stock runsc and bex's previous build
+        run: |
+          mkdir -p stock bex1
+          curl -fsSL -o stock/runsc "$STOCK_URL"
+          echo "$STOCK_SHA512  stock/runsc" | sha512sum -c -
+          curl -fsSL -o bex1/runsc "$BEX1_URL"
+          echo "$BEX1_SHA512  bex1/runsc" | sha512sum -c -
+          chmod -R a+rx stock bex1 patched
+      - name: Native Linux
+        run: python3 -I .github/bex/pty-signal-echo-probe.py
+      - name: Stock runsc (expected to differ)
+        run: |
+          if sudo stock/runsc --network=none do python3 -I "$PWD/.github/bex/pty-signal-echo-probe.py"; then
+            echo "::error::the stock runsc already handles these cases as Linux does"
+            exit 1
+          fi
+      - name: bex's previous build (expected to differ in the flush and Ctrl-U cases)
+        run: |
+          set +e
+          sudo bex1/runsc --network=none do python3 -I "$PWD/.github/bex/pty-signal-echo-probe.py" | tee out.txt
+          set -e
+          grep -q '^FAIL ctrl-c flushes the line' out.txt
+          grep -q '^FAIL ctrl-u erases the line' out.txt
+          test "$(grep -c '^FAIL' out.txt)" -eq 2
+      - name: Patched runsc, five times
+        run: |
+          for i in 1 2 3 4 5; do
+            sudo patched/runsc --network=none do python3 -I "$PWD/.github/bex/pty-signal-echo-probe.py"
+          done
