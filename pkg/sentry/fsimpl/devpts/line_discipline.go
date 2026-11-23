@@ -128,6 +128,34 @@ type lineDiscipline struct {
 	// Currently only TIOCPKT_FLUSHREAD and TIOCPKT_FLUSHWRITE are emitted
 	// through packetStatus.
 	packetStatus uint8
+
+	// echoBuf holds the echoes of the input being processed. They are written
+	// to outQueue once the input has been processed, as
+	// n_tty.c:flush_echoes() does at the end of n_tty_receive_buf(), so that
+	// a signal character can discard the echoes of the input before it along
+	// with that input (see flushForSignal).
+	//
+	// +checklocks:inQueue.mu
+	echoBuf []byte `state:"nosave"`
+
+	// signals are the signals raised by signal characters in the input being
+	// processed. They are sent after echoBuf is written, so that the echo of a
+	// signal character reaches the terminal ahead of anything the signaled
+	// process prints in response.
+	//
+	// +checklocks:inQueue.mu
+	signals []linux.Signal `state:"nosave"`
+
+	// Input processing holds termiosMu for reading and inQueue.mu, so it
+	// cannot update packetStatus or notify waiters itself. It leaves the
+	// TIOCPKT_* status bits for a packet mode master in pendingPacketStatus,
+	// and the events for replica waiters in pendingReplicaEvents, for
+	// notifyInputEvents to apply once those locks are released.
+	//
+	// +checklocks:inQueue.mu
+	pendingPacketStatus uint8 `state:"nosave"`
+	// +checklocks:inQueue.mu
+	pendingReplicaEvents waiter.EventMask `state:"nosave"`
 }
 
 func newLineDiscipline(termios linux.KernelTermios, terminal *Terminal) *lineDiscipline {
@@ -189,6 +217,7 @@ func (l *lineDiscipline) setTermios2(task *kernel.Task, args arch.SyscallArgumen
 	} else {
 		l.termiosMu.Unlock()
 	}
+	l.notifyInputEvents()
 
 	return 0, nil
 }
@@ -218,6 +247,7 @@ func (l *lineDiscipline) setTermios(task *kernel.Task, args arch.SyscallArgument
 	} else {
 		l.termiosMu.Unlock()
 	}
+	l.notifyInputEvents()
 
 	return 0, nil
 }
@@ -273,6 +303,7 @@ func (l *lineDiscipline) inputQueueRead(ctx context.Context, dst usermem.IOSeque
 	n, pushed, notifyEcho, err := l.inQueue.read(ctx, dst, l, false /* packet */)
 	isCanon := l.termios.LEnabled(linux.ICANON)
 	l.termiosMu.RUnlock()
+	l.notifyInputEvents()
 	if err != nil {
 		return 0, err
 	}
@@ -301,6 +332,7 @@ func (l *lineDiscipline) inputQueueWrite(ctx context.Context, src usermem.IOSequ
 	l.termiosMu.RLock()
 	n, notifyEcho, err := l.inQueue.write(ctx, src, l)
 	l.termiosMu.RUnlock()
+	l.notifyInputEvents()
 	if err != nil {
 		return 0, err
 	}
@@ -389,9 +421,12 @@ type outputQueueTransformer struct{}
 // transform does output processing for one end of the pty. See
 // drivers/tty/n_tty.c:do_output_char for an analogous kernel function.
 //
-// Preconditions:
-//   - l.termiosMu must be held for reading.
-//   - q.mu must be held.
+// q must be &l.outQueue. checklocks does not infer that identity from the
+// queue's transformer, so both mutex paths are annotated below.
+//
+// +checklocksread:l.termiosMu
+// +checklocks:q.mu
+// +checklocks:l.outQueue.mu
 func (*outputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte) (int, bool) {
 	// transformOutput is effectively always in noncanonical mode, as the
 	// master termios never has ICANON set.
@@ -486,12 +521,18 @@ type inputQueueTransformer struct{}
 // transformed according to flags set in the termios struct. See
 // drivers/tty/n_tty.c:n_tty_receive_char_special for an analogous kernel
 // function.
-// It returns an extra boolean indicating whether any characters need to be
-// echoed, in which case we need to notify readers.
 //
-// Preconditions:
-//   - l.termiosMu must be held for reading.
-//   - q.mu must be held.
+// It returns an extra boolean indicating whether to notify master readers of
+// possible echo output.
+//
+// q must be &l.inQueue. checklocks does not infer that identity from the
+// queue's transformer, so both mutex paths are annotated below. Writing echoes
+// acquires l.outQueue.mu separately.
+//
+// +checklocksread:l.termiosMu
+// +checklocks:q.mu
+// +checklocks:l.inQueue.mu
+// +checklocksexclude:l.outQueue.mu
 func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte) (int, bool) {
 	// If there's a line waiting to be read in canonical mode, don't write
 	// anything else to the read buffer.
@@ -621,7 +662,7 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 							// of bytes, presumably because some older terminals don't erase
 							// characters with \b, so we need to "erase" the old character
 							// by writing a space over it.
-							l.outQueue.writeBytes([]byte{'\b', ' ', '\b'}, l)
+							l.echo('\b', ' ', '\b')
 						}
 					}
 				}
@@ -679,43 +720,116 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 		q.readable = true
 	}
 
-	return ret, notifyEcho
+	return ret, l.flushEchoes() || notifyEcho
 }
 
 // receiveSignalChar handles a character that ISIG turns into sig, as
-// n_tty.c:n_tty_receive_signal_char() does: the character is not passed to the
-// reading process, the foreground process group gets sig, and with ECHO set the
-// character is echoed (as "^C" with ECHOCTL). It returns whether anything was
-// echoed.
+// n_tty.c:n_tty_receive_signal_char() does: unless NOFLSH is set, the input and
+// output waiting are flushed (see flushForSignal); the character is not passed
+// to the reading process, the foreground process group gets sig, and with ECHO
+// set the character is echoed (as "^C" with ECHOCTL). It returns whether
+// anything was echoed.
 //
-// The echo is queued before the signal is sent, so that it reaches the
-// terminal ahead of anything the signaled process prints in response.
+// The signal is sent once the echo is written (see flushEchoes).
 //
-// Preconditions:
-//   - l.termiosMu must be held for reading.
-//   - l.outQueue.mu must not be held.
+// +checklocksread:l.termiosMu
+// +checklocks:l.inQueue.mu
+// +checklocksexclude:l.outQueue.mu
 func (l *lineDiscipline) receiveSignalChar(cBytes []byte, sig linux.Signal) bool {
+	if !l.termios.LEnabled(linux.NOFLSH) {
+		l.flushForSignal()
+	}
+	l.signals = append(l.signals, sig)
 	echo := l.termios.LEnabled(linux.ECHO)
 	if echo {
 		l.echoChar(cBytes)
 	}
-	l.terminal.replicaKTTY.SignalForegroundProcessGroup(kernel.SignalInfoPriv(sig))
 	return echo
+}
+
+// flushForSignal discards what n_tty.c:isig() flushes when a signal character
+// is received and NOFLSH is clear: the echoes not written yet, the output the
+// master has no room for yet (pty.c:pty_flush_buffer() empties the buffer the
+// master takes output from), and the input not read yet. A packet mode master
+// is told TIOCPKT_FLUSHREAD and TIOCPKT_FLUSHWRITE.
+//
+// +checklocksread:l.termiosMu
+// +checklocks:l.inQueue.mu
+// +checklocksexclude:l.outQueue.mu
+func (l *lineDiscipline) flushForSignal() {
+	l.echoBuf = nil
+	l.inQueue.readBuf = l.inQueue.readBuf[:0]
+	l.inQueue.readable = false
+
+	l.outQueue.mu.Lock()
+	if l.outQueue.waitBufLen > 0 {
+		l.outQueue.waitBuf = nil
+		l.outQueue.waitBufLen = 0
+		l.pendingReplicaEvents |= waiter.WritableEvents
+	}
+	l.outQueue.mu.Unlock()
+	l.pendingPacketStatus |= linux.TIOCPKT_FLUSHREAD | linux.TIOCPKT_FLUSHWRITE
+}
+
+// echo queues b to be echoed. See echoBuf.
+//
+// +checklocks:l.inQueue.mu
+func (l *lineDiscipline) echo(b ...byte) {
+	l.echoBuf = append(l.echoBuf, b...)
+}
+
+// flushEchoes writes the echoes of the input processed so far to the output
+// queue, then sends the signals the input raised. It returns whether anything
+// was echoed.
+//
+// +checklocksread:l.termiosMu
+// +checklocks:l.inQueue.mu
+// +checklocksexclude:l.outQueue.mu
+func (l *lineDiscipline) flushEchoes() bool {
+	echoed := len(l.echoBuf) > 0
+	if echoed {
+		// The output queue keeps the slice it is given.
+		l.outQueue.writeBytes(l.echoBuf, l)
+		l.echoBuf = nil
+	}
+	for _, sig := range l.signals {
+		l.terminal.replicaKTTY.SignalForegroundProcessGroup(kernel.SignalInfoPriv(sig))
+	}
+	l.signals = l.signals[:0]
+	return echoed
+}
+
+// notifyInputEvents does what input processing left for once termiosMu and
+// inQueue.mu are released: it reports TIOCPKT_* status to a packet mode
+// master and notifies replica waiters.
+//
+// +checklocksexclude:l.termiosMu
+// +checklocksexclude:l.inQueue.mu
+// +checklocksexclude:l.masterWaiter.mu
+// +checklocksexclude:l.replicaWaiter.mu
+func (l *lineDiscipline) notifyInputEvents() {
+	l.inQueue.mu.Lock()
+	status, events := l.pendingPacketStatus, l.pendingReplicaEvents
+	l.pendingPacketStatus, l.pendingReplicaEvents = 0, 0
+	l.inQueue.mu.Unlock()
+	l.notifyPacketStatus(status)
+	if events != 0 {
+		l.replicaWaiter.Notify(events)
+	}
 }
 
 // echoInput echoes a character that was queued for the reading process, as
 // n_tty.c:n_tty_receive_char_special() and n_tty_receive_char() do. crToNL is
 // whether the character is a carriage return that ICRNL turned into a newline.
 //
-// Preconditions:
-//   - l.termiosMu must be held for reading.
-//   - l.outQueue.mu must not be held.
+// +checklocksread:l.termiosMu
+// +checklocks:l.inQueue.mu
 func (l *lineDiscipline) echoInput(cBytes []byte, crToNL bool) {
 	c := cBytes[0]
 	switch {
 	case c == '\n' && (crToNL || l.termios.LEnabled(linux.ICANON)):
 		// A line's newline is echoed as is, never as "^J".
-		l.outQueue.writeBytes(cBytes, l)
+		l.echo(cBytes...)
 	case l.termios.IEnabled(linux.IXON) &&
 		(l.termios.IsControlChar(c, linux.VSTART) || l.termios.IsControlChar(c, linux.VSTOP)):
 		// With IXON, Linux consumes START and STOP as flow control
@@ -730,15 +844,14 @@ func (l *lineDiscipline) echoInput(cBytes []byte, crToNL bool) {
 // 6 flipped ("^C" for 0x03, "^?" for DEL), and any other character is echoed
 // as is.
 //
-// Preconditions:
-//   - l.termiosMu must be held for reading.
-//   - l.outQueue.mu must not be held.
+// +checklocksread:l.termiosMu
+// +checklocks:l.inQueue.mu
 func (l *lineDiscipline) echoChar(cBytes []byte) {
 	if c := cBytes[0]; l.termios.LEnabled(linux.ECHOCTL) && isControl(c) && c != '\t' {
-		l.outQueue.writeBytes([]byte{'^', c ^ 0100}, l)
+		l.echo('^', c^0100)
 		return
 	}
-	l.outQueue.writeBytes(cBytes, l)
+	l.echo(cBytes...)
 }
 
 // isControl returns whether c is a control character, as the kernel's

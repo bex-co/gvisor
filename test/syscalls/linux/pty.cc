@@ -1825,6 +1825,64 @@ TEST_F(PtyTest, DisabledCharsAreOrdinary) {
   ExpectReadExactly(replica_, line);
 }
 
+// Unless NOFLSH is set, a signal character discards the input typed before
+// it, as n_tty.c:isig() does.
+TEST_F(PtyTest, SignalCharFlushesInput) {
+  WriteAll(master_, "abc");
+  ExpectEcho(master_, "abc");
+  WriteAll(master_, std::string(1, ControlCharacter('C')));
+  ExpectEcho(master_, "^C");
+  TestCanonicalIO("\n", "\n", "\r\n");
+}
+
+// With NOFLSH, the input typed before a signal character is kept.
+TEST_F(PtyTest, SignalCharFlushSkippedWithNOFLSH) {
+  struct kernel_termios t = DefaultTermios();
+  t.c_lflag |= NOFLSH;
+  ASSERT_THAT(ioctl(replica_.get(), TCSETS, &t), SyscallSucceeds());
+
+  WriteAll(master_, "abc");
+  ExpectEcho(master_, "abc");
+  WriteAll(master_, std::string(1, ControlCharacter('C')));
+  ExpectEcho(master_, "^C");
+  TestCanonicalIO("\n", "abc\n", "\r\n");
+}
+
+// The flush also discards the echoes not written to the terminal yet: those of
+// the input written along with the signal character, including the echo of an
+// earlier signal character.
+TEST_F(PtyTest, SignalCharFlushDiscardsPendingEchoes) {
+  TestCanonicalIO("abc\x03\n", "\n", "^C\r\n");
+  TestCanonicalIO(
+      "ab\x1c"
+      "c\x1a"
+      "d\n",
+      "d\n", "^Zd\r\n");
+}
+
+// In noncanonical mode, the flush discards all the input not read yet.
+TEST_F(PtyTest, SignalCharFlushesNoncanonicalInput) {
+  DisableCanonical();
+
+  WriteAll(master_, "abc");
+  ExpectEcho(master_, "abc");
+  ASSERT_NO_ERRNO(WaitUntilReceived(replica_.get(), 3));
+  WriteAll(master_, std::string(1, ControlCharacter('C')));
+  ExpectEcho(master_, "^C");
+  ExpectFinished(replica_);
+}
+
+// A packet mode master is told about the flush.
+TEST_F(PtyTest, SignalCharFlushReportsPacketModeStatus) {
+  EnablePacketMode();
+
+  WriteAll(master_, "abc");
+  ExpectEcho(master_, std::string("\0abc", 4));
+  WriteAll(master_, std::string(1, ControlCharacter('C')));
+  ExpectMasterPacketStatus(TIOCPKT_FLUSHREAD | TIOCPKT_FLUSHWRITE);
+  ExpectEcho(master_, std::string("\0^C", 3));
+}
+
 TEST_F(PtyTest, GetWindowSize) {
   struct winsize ws;
   ASSERT_THAT(ioctl(replica_.get(), TIOCGWINSZ, &ws), SyscallSucceeds());
