@@ -1938,8 +1938,7 @@ TEST_F(PtyTest, NoncanonNewlineEchoedWithECHOCTL) {
 }
 
 // With IXON, START and STOP are flow control characters, which are never
-// echoed. (gVisor passes them to the reader, as it does not implement flow
-// control, so the reader's side is not checked.)
+// echoed.
 TEST_F(PtyTest, FlowControlCharsNotEchoedWithIXON) {
   constexpr char kInput[] = {ControlCharacter('S'), ControlCharacter('Q'), 'x'};
   ASSERT_THAT(WriteFd(master_.get(), kInput, sizeof(kInput)),
@@ -2190,6 +2189,143 @@ TEST_F(PtyTest, LiteralNextAndReprintCharInNoncanonicalMode) {
   WriteAll(master_, "\x16\x12");
   ExpectEcho(master_, "^V^R");
   ExpectReadExactly(replica_, "\x16\x12");
+}
+
+// Waits until poll reports fd writable, or not writable, as want says.
+PosixError WaitUntilWritable(int fd, bool want) {
+  absl::Time end = absl::Now() + kTimeout;
+  while (absl::Now() < end) {
+    struct pollfd pfd = {fd, POLLOUT, 0};
+    int ret = RetryEINTR(poll)(&pfd, 1, 0);
+    if (ret < 0) {
+      return PosixError(errno, "poll failed");
+    }
+    if ((ret == 1) == want) {
+      return NoError();
+    }
+    absl::SleepFor(absl::Milliseconds(10));
+  }
+  return PosixError(ETIMEDOUT, want ? "never writable" : "still writable");
+}
+
+// Types VSTOP and waits until output is stopped.
+void StopOutput(const FileDescriptor& master, const FileDescriptor& replica) {
+  WriteAll(master, std::string(1, ControlCharacter('S')));
+  ASSERT_NO_ERRNO(WaitUntilWritable(replica.get(), false));
+}
+
+// With IXON, as by default, VSTOP stops output from the replica and VSTART
+// starts it again, as tty_io.c:stop_tty() and start_tty() do. While output is
+// stopped, the replica is not writable and cannot write (pty.c:pty_write()).
+TEST_F(PtyTest, StopCharHoldsOutput) {
+  StopOutput(master_, replica_);
+  char c = 'x';
+  EXPECT_THAT(WriteFd(replica_.get(), &c, 1), SyscallFailsWithErrno(EAGAIN));
+  ExpectFinished(master_);
+
+  WriteAll(master_, std::string(1, ControlCharacter('Q')));
+  ASSERT_NO_ERRNO(WaitUntilWritable(replica_.get(), true));
+  WriteAll(replica_, "out");
+  ExpectEcho(master_, "out");
+}
+
+// A blocking write waits for output to start.
+TEST_F(PtyTest, StopCharBlocksWriter) {
+  FileDescriptor replica =
+      ASSERT_NO_ERRNO_AND_VALUE(OpenReplica(master_, O_RDWR | O_NOCTTY));
+  StopOutput(master_, replica_);
+
+  absl::Notification written;
+  int fd = replica.get();
+  ScopedThread th([fd, &written]() {
+    EXPECT_THAT(WriteFd(fd, "out", 3), SyscallSucceedsWithValue(3));
+    written.Notify();
+  });
+  EXPECT_FALSE(written.WaitForNotificationWithTimeout(absl::Seconds(1)));
+  WriteAll(master_, std::string(1, ControlCharacter('Q')));
+  EXPECT_TRUE(written.WaitForNotificationWithTimeout(kTimeout));
+  th.Join();
+  ExpectEcho(master_, "out");
+}
+
+// While output is stopped, the echoes of input wait too, but the input reaches
+// the reader.
+TEST_F(PtyTest, StopCharHoldsEchoes) {
+  DisableCanonical();
+  WriteAll(master_,
+           "\x13"
+           "ab");
+  ExpectReadExactly(replica_, "ab");
+  ExpectFinished(master_);
+
+  WriteAll(master_, "\x11");
+  ExpectEcho(master_, "ab");
+}
+
+// VSTOP and VSTART are not passed to the reader.
+TEST_F(PtyTest, StopCharAndStartCharAreNotRead) {
+  TestCanonicalIO(
+      "\x13\x11"
+      "a\n",
+      "a\n", "a\r\n");
+}
+
+// Without IXON, they are ordinary characters.
+TEST_F(PtyTest, StopCharWithoutIXONIsOrdinary) {
+  struct kernel_termios t = DefaultTermios();
+  t.c_iflag &= ~IXON;
+  ASSERT_THAT(ioctl(replica_.get(), TCSETS, &t), SyscallSucceeds());
+
+  TestCanonicalIO(
+      "\x13\x11"
+      "a\n",
+      "\x13\x11"
+      "a\n",
+      "^S^Qa\r\n");
+}
+
+// A packet mode master is told TIOCPKT_STOP and TIOCPKT_START, each of which
+// replaces the other (pty.c:pty_stop() and pty_start()).
+TEST_F(PtyTest, StopCharReportsPacketModeStatus) {
+  EnablePacketMode();
+
+  WriteAll(master_, std::string(1, ControlCharacter('S')));
+  ExpectMasterPacketStatus(TIOCPKT_STOP);
+  WriteAll(master_, std::string(1, ControlCharacter('Q')));
+  ExpectMasterPacketStatus(TIOCPKT_START);
+  WriteAll(master_, "\x13\x11");
+  ExpectMasterPacketStatus(TIOCPKT_START);
+}
+
+// With IXANY, any input character starts output again.
+TEST_F(PtyTest, StopCharThenIXANYRestarts) {
+  struct kernel_termios t = DefaultTermios();
+  t.c_iflag |= IXANY;
+  ASSERT_THAT(ioctl(replica_.get(), TCSETS, &t), SyscallSucceeds());
+
+  StopOutput(master_, replica_);
+  WriteAll(master_, "x");
+  ExpectEcho(master_, "x");
+  ASSERT_NO_ERRNO(WaitUntilWritable(replica_.get(), true));
+}
+
+// A signal character starts output again.
+TEST_F(PtyTest, StopCharThenSignalCharRestarts) {
+  StopOutput(master_, replica_);
+  WriteAll(master_, std::string(1, ControlCharacter('C')));
+  ExpectEcho(master_, "^C");
+  ASSERT_NO_ERRNO(WaitUntilWritable(replica_.get(), true));
+}
+
+// Turning IXON off starts output again.
+TEST_F(PtyTest, StopCharThenClearingIXONRestarts) {
+  StopOutput(master_, replica_);
+  struct kernel_termios t = DefaultTermios();
+  t.c_iflag &= ~IXON;
+  ASSERT_THAT(ioctl(replica_.get(), TCSETS, &t), SyscallSucceeds());
+  ASSERT_NO_ERRNO(WaitUntilWritable(replica_.get(), true));
+  WriteAll(replica_, "out");
+  ExpectEcho(master_, "out");
 }
 
 TEST_F(PtyTest, GetWindowSize) {
