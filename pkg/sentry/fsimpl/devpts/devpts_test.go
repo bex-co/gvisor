@@ -15,6 +15,7 @@
 package devpts
 
 import (
+	"bytes"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -225,12 +226,42 @@ func readAvailable(t *testing.T, read func(context.Context, usermem.IOSequence) 
 	return string(buf[:n])
 }
 
+// TestSignalFlushesOutputMasterHasNoRoomFor checks that a signal character
+// discards the output the master has no room for, as
+// drivers/tty/pty.c:pty_flush_buffer() does on Linux, and keeps what the
+// master can already read. (On Linux, how much the master can already read
+// depends on how far a worker thread got, so this is checked here rather than
+// in a syscall test.)
+func TestSignalFlushesOutputMasterHasNoRoomFor(t *testing.T) {
+	ctx := contexttest.Context(t)
+	termios := linux.DefaultReplicaTermios
+	termios.LocalFlags &^= linux.ECHO
+	ld := newTestLineDiscipline(termios)
+
+	output := bytes.Repeat([]byte{'x'}, 3*canonMaxBytes)
+	if n, err := ld.outputQueueWrite(ctx, usermem.BytesIOSequence(output)); err != nil || n != int64(len(output)) {
+		t.Fatalf("outputQueueWrite = %d, %v, want %d, nil", n, err, len(output))
+	}
+	if _, err := ld.inputQueueWrite(ctx, usermem.BytesIOSequence([]byte("\x03"))); err != nil {
+		t.Fatalf("inputQueueWrite: %v", err)
+	}
+	read := 0
+	for s := readAvailable(t, ld.outputQueueRead); s != ""; s = readAvailable(t, ld.outputQueueRead) {
+		read += len(s)
+	}
+	if read != nonCanonMaxBytes {
+		t.Errorf("master read %d bytes after the signal, want %d", read, nonCanonMaxBytes)
+	}
+}
+
 // TestEcho checks what the line discipline echoes back to the master and
 // passes to the replica, against what drivers/tty/n_tty.c does on Linux.
 func TestEcho(t *testing.T) {
 	for _, test := range []struct {
 		name string
-		// lflagsOff are the local flags cleared from the default termios.
+		// lflagsOn and lflagsOff are the local flags set in and cleared from
+		// the default termios.
+		lflagsOn  uint32
 		lflagsOff uint32
 		input     string
 		// echo is what the master reads back.
@@ -245,6 +276,9 @@ func TestEcho(t *testing.T) {
 		{name: "interrupt without ECHO", lflagsOff: linux.ECHO, input: "\x03"},
 		{name: "interrupt without ISIG", lflagsOff: linux.ISIG | linux.ICANON, input: "\x03", echo: "^C", read: "\x03"},
 		{name: "interrupt then a line", input: "\x03ab\n", echo: "^Cab\r\n", read: "ab\n"},
+		{name: "interrupt flushes the line before it", input: "abc\x03\n", echo: "^C\r\n", read: "\n"},
+		{name: "suspend flushes the echo of an earlier quit", input: "ab\x1cc\x1ad\n", echo: "^Zd\r\n", read: "d\n"},
+		{name: "interrupt with NOFLSH", lflagsOn: linux.NOFLSH, input: "abc\x03\n", echo: "abc^C\r\n", read: "abc\n"},
 		{name: "control characters", input: "a\x01\x1b\tb\n", echo: "a^A^[\tb\r\n", read: "a\x01\x1b\tb\n"},
 		{name: "control characters without ECHOCTL", lflagsOff: linux.ECHOCTL, input: "a\x01b\n", echo: "a\x01b\r\n", read: "a\x01b\n"},
 		{name: "carriage return", input: "\r", echo: "\r\n", read: "\n"},
@@ -254,6 +288,7 @@ func TestEcho(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			termios := linux.DefaultReplicaTermios
+			termios.LocalFlags |= test.lflagsOn
 			termios.LocalFlags &^= test.lflagsOff
 			ld := newTestLineDiscipline(termios)
 
