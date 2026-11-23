@@ -2506,6 +2506,49 @@ TEST_F(PtyTest, EraseTabWithControlCharsAndKill) {
   TestCanonicalIO("\x01\t\x7f\n", "\x01\n", "\x01\t\b\b\b\b\b\b\b\b\r\n");
 }
 
+// With ECHOPRT, canonical erasures echo '\', each erased character, and '/'
+// when typing resumes (n_tty.c:eraser() and finish_erasing()).
+TEST_F(PtyTest, EchoPrtEraseAndResume) {
+  SetLocalFlags(replica_, ECHOPRT, 0);
+  TestCanonicalIO("abc\x7f\x7f" "de\n", "ade\n", "abc\\cb/de\r\n");
+  TestCanonicalIO("ab\x7f\x7f\x7f" "cd\n", "cd\n", "ab\\ba/cd\r\n");
+  TestCanonicalIO("\x7f" "a\n", "a\n", "a\r\n");
+}
+
+// ECHOPRT echoes erased control characters and tabs, and applies to VWERASE
+// and VKILL (with ECHOKE) as well as closing before VREPRINT and VLNEXT.
+TEST_F(PtyTest, EchoPrtControlCharsWordEraseKillAndReprint) {
+  SetLocalFlags(replica_, ECHOPRT, 0);
+  TestCanonicalIO("a\x01\t\x7f\x7f\x7f" "x\n", "x\n", "a^A\t\\\t^Aa/x\r\n");
+  TestCanonicalIO("foo bar\x17" "x\n", "foo x\n", "foo bar\\rab/x\r\n");
+  TestCanonicalIO("abc\x15" "def\n", "def\n", "abc\\cba/def\r\n");
+  TestCanonicalIO("abc\x7f\x12" "d\n", "abd\n", "abc\\c/^R\r\nabd\r\n");
+  TestCanonicalIO("abc\x7f\x16\x03\n", "ab\x03\n", "abc\\c/^\b^C\r\n");
+}
+
+// A signal flush, TCIFLUSH, or leaving canonical mode clears ECHOPRT erasing
+// state without echoing '/', while a newline leaves erasing open until the
+// next non-terminating character.
+TEST_F(PtyTest, EchoPrtNewlineAndSignalFlush) {
+  SetLocalFlags(replica_, ECHOPRT, 0);
+  WriteAll(master_, "ab\x7f\nc\n");
+  ExpectEcho(master_, "ab\\b\r\n/c\r\n");
+  char buf[16] = {};
+  ASSERT_THAT(RetryEINTR(read)(replica_.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(2));
+  EXPECT_EQ(std::string(buf, 2), "a\n");
+  ASSERT_THAT(RetryEINTR(read)(replica_.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(2));
+  EXPECT_EQ(std::string(buf, 2), "c\n");
+  ExpectFinished(replica_);
+
+  WriteAll(master_, "abc\x7f");
+  ExpectEcho(master_, "abc\\c");
+  WriteAll(master_, "\x03" "d\n");
+  ExpectEcho(master_, "^Cd\r\n");
+  ExpectReadExactly(replica_, "d\n");
+}
+
 TEST_F(PtyTest, GetWindowSize) {
   struct winsize ws;
   ASSERT_THAT(ioctl(replica_.get(), TIOCGWINSZ, &ws), SyscallSucceeds());
