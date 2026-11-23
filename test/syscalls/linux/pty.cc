@@ -1883,6 +1883,94 @@ TEST_F(PtyTest, SignalCharFlushReportsPacketModeStatus) {
   ExpectEcho(master_, std::string("\0^C", 3));
 }
 
+// Sets the replica to the default termios with the given local flags set and
+// cleared.
+void SetLocalFlags(const FileDescriptor& replica, tcflag_t set,
+                   tcflag_t clear) {
+  struct kernel_termios t = DefaultTermios();
+  t.c_lflag |= set;
+  t.c_lflag &= ~clear;
+  ASSERT_THAT(ioctl(replica.get(), TCSETS, &t), SyscallSucceeds());
+}
+
+// Types "abc" and the kill character, and checks the kill character's echo.
+void TypeLineAndKill(const FileDescriptor& master, const std::string& echo) {
+  WriteAll(master, "abc");
+  ExpectEcho(master, "abc");
+  WriteAll(master, std::string(1, ControlCharacter('U')));
+  ExpectEcho(master, echo);
+}
+
+// With ECHOK, ECHOKE and ECHOE, as by default, the kill character erases the
+// line typed so far and each of its characters from the screen. This matches
+// n_tty.c:eraser().
+TEST_F(PtyTest, KillCharErasesLine) {
+  TypeLineAndKill(master_, "\b \b\b \b\b \b");
+  TestCanonicalIO("def\n", "def\n", "def\r\n");
+}
+
+// Without ECHOKE, the line is erased and the kill character echoed, followed
+// by a newline with ECHOK.
+TEST_F(PtyTest, KillCharWithoutECHOKE) {
+  SetLocalFlags(replica_, 0, ECHOKE);
+  TypeLineAndKill(master_, "^U\r\n");
+  TestCanonicalIO("def\n", "def\n", "def\r\n");
+}
+
+// Without ECHOK either, only the kill character is echoed.
+TEST_F(PtyTest, KillCharWithoutECHOKAndECHOKE) {
+  SetLocalFlags(replica_, 0, ECHOK | ECHOKE);
+  TypeLineAndKill(master_, "^U");
+  TestCanonicalIO("def\n", "def\n", "def\r\n");
+}
+
+// Without ECHO, the line is erased silently.
+TEST_F(PtyTest, KillCharWithoutECHO) {
+  SetLocalFlags(replica_, 0, ECHO);
+  WriteAll(master_,
+           "abc\x15"
+           "def\n");
+  ASSERT_NO_ERRNO(WaitUntilReceived(replica_.get(), 4));
+  ExpectReadExactly(replica_, "def\n");
+  ExpectFinished(master_);
+}
+
+// On an empty line, the kill character does nothing, not even echo.
+TEST_F(PtyTest, KillCharOnEmptyLine) {
+  SetLocalFlags(replica_, 0, ECHOKE);
+  WriteAll(master_, std::string(1, ControlCharacter('U')));
+  TestCanonicalIO("def\n", "def\n", "def\r\n");
+}
+
+// A control character shown as ^X is erased from the screen as two columns.
+TEST_F(PtyTest, KillCharErasesControlChars) {
+  WriteAll(master_,
+           "a\x01"
+           "b");
+  ExpectEcho(master_, "a^Ab");
+  WriteAll(master_, std::string(1, ControlCharacter('U')));
+  ExpectEcho(master_, "\b \b\b \b\b \b\b \b");
+}
+
+// In noncanonical mode, the kill character is an ordinary character.
+TEST_F(PtyTest, KillCharInNoncanonicalMode) {
+  DisableCanonical();
+  WriteAll(master_, "a\x15");
+  ExpectEcho(master_, "a^U");
+  ExpectReadExactly(replica_, "a\x15");
+}
+
+// Without ECHOE, the erase character is echoed rather than erasing the
+// character from the screen.
+TEST_F(PtyTest, EraseCharWithoutECHOE) {
+  SetLocalFlags(replica_, 0, ECHOE);
+  WriteAll(master_, "ab");
+  ExpectEcho(master_, "ab");
+  WriteAll(master_, "\x7f");
+  ExpectEcho(master_, "^?");
+  TestCanonicalIO("\n", "a\n", "\r\n");
+}
+
 TEST_F(PtyTest, GetWindowSize) {
   struct winsize ws;
   ASSERT_THAT(ioctl(replica_.get(), TIOCGWINSZ, &ws), SyscallSucceeds());

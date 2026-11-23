@@ -594,20 +594,37 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 
 		// In canonical mode, some characters need to be handled specially; for example, backspace.
 		// This roughly aligns with n_tty.c:n_tty_receive_char_canon and n_tty.c:eraser
-		// cBytes[0] == ControlCharacters[linux.VKILL] is also handled by n_tty.c:eraser, but this isn't implemented
 		case l.termios.IsControlChar(c, linux.VWERASE):
 			if !l.termios.LEnabled(linux.IEXTEN) {
 				break
 			}
 			fallthrough
-		case l.termios.IsControlChar(c, linux.VERASE):
+		case l.termios.IsControlChar(c, linux.VERASE), l.termios.IsControlChar(c, linux.VKILL):
 			if !l.termios.LEnabled(linux.ICANON) {
 				break
 			}
 
-			killType := linux.VERASE
-			if l.termios.IsControlChar(c, linux.VWERASE) {
+			killType := linux.VKILL
+			switch {
+			case l.termios.IsControlChar(c, linux.VERASE):
+				killType = linux.VERASE
+			case l.termios.IsControlChar(c, linux.VWERASE):
 				killType = linux.VWERASE
+			}
+			// VKILL erases the whole line. Only with ECHO, ECHOK, ECHOKE
+			// and ECHOE all set is each character erased from the screen,
+			// as VERASE does with ECHOE. Otherwise the line is dropped and,
+			// with ECHO, the kill character is echoed, followed by a
+			// newline with ECHOK.
+			if killType == linux.VKILL && len(q.readBuf) > 0 && !(l.termios.LEnabled(linux.ECHO) &&
+				l.termios.LEnabled(linux.ECHOK) && l.termios.LEnabled(linux.ECHOKE) && l.termios.LEnabled(linux.ECHOE)) {
+				q.readBuf = q.readBuf[:0]
+				if l.termios.LEnabled(linux.ECHO) {
+					l.echoChar(cBytes)
+					if l.termios.LEnabled(linux.ECHOK) {
+						l.echo('\n')
+					}
+				}
 			}
 			seenAlphanumeric := false
 			for len(q.readBuf) > 0 {
@@ -639,7 +656,9 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 					if l.termios.LEnabled(linux.ECHOPRT) {
 						// Not implemented
 					} else if killType == linux.VERASE && !l.termios.LEnabled(linux.ECHOE) {
-						// Not implemented
+						// Without ECHOE, the erase character is echoed
+						// instead of erasing the character from the screen.
+						l.echoChar(cBytes)
 					} else if toErase == '\t' {
 						// Not implemented
 					} else {
