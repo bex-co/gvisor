@@ -125,8 +125,8 @@ type lineDiscipline struct {
 	// packetStatus contains pending TIOCPKT_* status bits for the next master
 	// read while packet mode is enabled.
 	//
-	// Currently only TIOCPKT_FLUSHREAD and TIOCPKT_FLUSHWRITE are emitted
-	// through packetStatus.
+	// Currently only TIOCPKT_FLUSHREAD, TIOCPKT_FLUSHWRITE, TIOCPKT_STOP and
+	// TIOCPKT_START are emitted through packetStatus.
 	packetStatus uint8
 
 	// lnext is whether the next character of input is queued as is, because
@@ -134,6 +134,12 @@ type lineDiscipline struct {
 	//
 	// +checklocks:inQueue.mu
 	lnext bool
+
+	// stopped is whether output is stopped, as tty_struct.flow.stopped is on
+	// Linux (see stopOutput).
+	//
+	// +checklocks:outQueue.mu
+	stopped bool
 
 	// echoBuf holds the echoes of the input being processed. They are written
 	// to outQueue once the input has been processed, as
@@ -206,28 +212,7 @@ func (l *lineDiscipline) setTermios2(task *kernel.Task, args arch.SyscallArgumen
 		return 0, err
 	}
 
-	l.termiosMu.Lock()
-	oldCanonEnabled := l.termios.LEnabled(linux.ICANON)
-	l.termios = t
-
-	// If canonical mode is turned off, move bytes from inQueue's wait
-	// buffer to its read buffer. Anything already in the read buffer is
-	// now readable.
-	if oldCanonEnabled && !l.termios.LEnabled(linux.ICANON) {
-		l.inQueue.mu.Lock()
-		// A VLNEXT applies only in canonical mode (see
-		// n_tty.c:n_tty_set_termios()).
-		l.lnext = false
-		l.inQueue.pushWaitBufLocked(l)
-		l.inQueue.readable = len(l.inQueue.readBuf) > 0
-		l.inQueue.mu.Unlock()
-		l.termiosMu.Unlock()
-		l.replicaWaiter.Notify(waiter.ReadableEvents)
-	} else {
-		l.termiosMu.Unlock()
-	}
-	l.notifyInputEvents()
-
+	l.updateTermios(func(termios *linux.KernelTermios) { *termios = t })
 	return 0, nil
 }
 
@@ -239,29 +224,47 @@ func (l *lineDiscipline) setTermios(task *kernel.Task, args arch.SyscallArgument
 		return 0, err
 	}
 
-	l.termiosMu.Lock()
-	oldCanonEnabled := l.termios.LEnabled(linux.ICANON)
-	l.termios.FromTermios(t)
+	l.updateTermios(func(termios *linux.KernelTermios) { termios.FromTermios(t) })
+	return 0, nil
+}
 
+// updateTermios applies update to l.termios, then updates the queues for the
+// change as n_tty.c:n_tty_set_termios() does.
+//
+// +checklocksexclude:l.termiosMu
+// +checklocksexclude:l.inQueue.mu
+// +checklocksexclude:l.outQueue.mu
+// +checklocksexclude:l.masterWaiter.mu
+// +checklocksexclude:l.replicaWaiter.mu
+func (l *lineDiscipline) updateTermios(update func(*linux.KernelTermios)) {
+	l.termiosMu.Lock()
+	old := l.termios
+	update(&l.termios)
+	var readable, notifyMaster bool
+	l.inQueue.mu.Lock()
 	// If canonical mode is turned off, move bytes from inQueue's wait
 	// buffer to its read buffer. Anything already in the read buffer is
-	// now readable.
-	if oldCanonEnabled && !l.termios.LEnabled(linux.ICANON) {
-		l.inQueue.mu.Lock()
-		// A VLNEXT applies only in canonical mode (see
-		// n_tty.c:n_tty_set_termios()).
+	// now readable. A VLNEXT applies only in canonical mode.
+	if old.LEnabled(linux.ICANON) && !l.termios.LEnabled(linux.ICANON) {
 		l.lnext = false
-		l.inQueue.pushWaitBufLocked(l)
+		_, notifyMaster = l.inQueue.pushWaitBufLocked(l)
 		l.inQueue.readable = len(l.inQueue.readBuf) > 0
-		l.inQueue.mu.Unlock()
-		l.termiosMu.Unlock()
+		readable = true
+	}
+	// Output stopped under IXON starts again when IXON is turned off.
+	if old.IEnabled(linux.IXON) && !l.termios.IEnabled(linux.IXON) {
+		notifyMaster = l.startOutput() || notifyMaster
+	}
+	l.inQueue.mu.Unlock()
+	l.termiosMu.Unlock()
+
+	if readable {
 		l.replicaWaiter.Notify(waiter.ReadableEvents)
-	} else {
-		l.termiosMu.Unlock()
+	}
+	if notifyMaster {
+		l.masterWaiter.Notify(waiter.ReadableEvents)
 	}
 	l.notifyInputEvents()
-
-	return 0, nil
 }
 
 func (l *lineDiscipline) windowSize(t *kernel.Task, args arch.SyscallArguments) error {
@@ -302,7 +305,13 @@ func (l *lineDiscipline) masterReadiness() waiter.EventMask {
 func (l *lineDiscipline) replicaReadiness() waiter.EventMask {
 	l.termiosMu.RLock()
 	defer l.termiosMu.RUnlock()
-	return l.outQueue.writeReadiness(&l.termios) | l.inQueue.readReadiness(&l.termios)
+	res := l.inQueue.readReadiness(&l.termios)
+	// While output is stopped, the replica cannot write (see
+	// outputQueueWrite).
+	if !l.outputStopped() {
+		res |= l.outQueue.writeReadiness(&l.termios)
+	}
+	return res
 }
 
 func (l *lineDiscipline) inputQueueReadSize(t *kernel.Task, io usermem.IO, args arch.SyscallArguments) error {
@@ -389,6 +398,12 @@ func (l *lineDiscipline) outputQueueRead(ctx context.Context, dst usermem.IOSequ
 
 func (l *lineDiscipline) outputQueueWrite(ctx context.Context, src usermem.IOSequence) (int64, error) {
 	l.termiosMu.RLock()
+	// While output is stopped, the replica cannot write: pty.c:pty_write()
+	// writes nothing then, so a blocking writer waits for output to start.
+	if src.NumBytes() > 0 && l.outputStopped() {
+		l.termiosMu.RUnlock()
+		return 0, linuxerr.ErrWouldBlock
+	}
 	// Ignore notifyEcho, as it cannot happen when writing to the output queue.
 	n, _, err := l.outQueue.write(ctx, src, l)
 	l.termiosMu.RUnlock()
@@ -440,6 +455,12 @@ type outputQueueTransformer struct{}
 // +checklocks:q.mu
 // +checklocks:l.outQueue.mu
 func (*outputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte) (int, bool) {
+	// While output is stopped, nothing reaches the master. The echoes of
+	// input wait in the wait buffer until output starts.
+	if l.stopped {
+		return 0, false
+	}
+
 	// transformOutput is effectively always in noncanonical mode, as the
 	// master termios never has ICANON set.
 	sizeBudget := nonCanonMaxBytes - len(q.readBuf)
@@ -567,6 +588,7 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 			// line. Like any such character, it is discarded once the line
 			// is full (see shouldDiscard).
 			l.lnext = false
+			notifyEcho = l.restartOutputOnAny() || notifyEcho
 			buf = buf[size:]
 			ret += size
 			if len(q.readBuf)+size >= canonMaxBytes {
@@ -578,11 +600,37 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 			}
 			continue
 		}
+		// We're guaranteed that cBytes has at least one element.
+		c := cBytes[0]
+		// With IXON, VSTART and VSTOP start and stop output and are consumed
+		// (n_tty.c:n_tty_receive_char_flow_ctrl()).
+		if l.termios.IEnabled(linux.IXON) {
+			if l.termios.IsControlChar(c, linux.VSTART) {
+				notifyEcho = l.startOutput() || notifyEcho
+				buf = buf[size:]
+				ret += size
+				continue
+			}
+			if l.termios.IsControlChar(c, linux.VSTOP) {
+				l.stopOutput()
+				buf = buf[size:]
+				ret += size
+				continue
+			}
+		}
+		if l.termios.LEnabled(linux.ISIG) {
+			if sig, ok := l.signalFor(c); ok {
+				notifyEcho = l.receiveSignalChar(cBytes, sig) || notifyEcho
+				buf = buf[size:]
+				ret += size
+				continue
+			}
+		}
+		notifyEcho = l.restartOutputOnAny() || notifyEcho
+
 		// crToNL is whether cBytes is a carriage return that ICRNL turned
 		// into a newline.
 		crToNL := false
-		// We're guaranteed that cBytes has at least one element.
-		c := cBytes[0]
 		switch {
 		case c == '\r':
 			if l.termios.IEnabled(linux.IGNCR) {
@@ -597,27 +645,6 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 		case c == '\n':
 			if l.termios.IEnabled(linux.INLCR) {
 				cBytes[0] = '\r'
-			}
-		case l.termios.IsControlChar(c, linux.VINTR): // ctrl-c
-			if l.termios.LEnabled(linux.ISIG) {
-				notifyEcho = l.receiveSignalChar(cBytes, linux.SIGINT) || notifyEcho
-				buf = buf[size:]
-				ret += size
-				continue
-			}
-		case l.termios.IsControlChar(c, linux.VSUSP): // ctrl-z
-			if l.termios.LEnabled(linux.ISIG) {
-				notifyEcho = l.receiveSignalChar(cBytes, linux.SIGTSTP) || notifyEcho
-				buf = buf[size:]
-				ret += size
-				continue
-			}
-		case l.termios.IsControlChar(c, linux.VQUIT): // ctrl-\
-			if l.termios.LEnabled(linux.ISIG) {
-				notifyEcho = l.receiveSignalChar(cBytes, linux.SIGQUIT) || notifyEcho
-				buf = buf[size:]
-				ret += size
-				continue
 			}
 
 		// In canonical mode, some characters need to be handled specially; for example, backspace.
@@ -802,12 +829,27 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 	return ret, l.flushEchoes() || notifyEcho
 }
 
+// signalFor returns the signal that c raises under ISIG, if any.
+//
+// +checklocksread:l.termiosMu
+func (l *lineDiscipline) signalFor(c byte) (linux.Signal, bool) {
+	switch {
+	case l.termios.IsControlChar(c, linux.VINTR): // ctrl-c
+		return linux.SIGINT, true
+	case l.termios.IsControlChar(c, linux.VQUIT): // ctrl-\
+		return linux.SIGQUIT, true
+	case l.termios.IsControlChar(c, linux.VSUSP): // ctrl-z
+		return linux.SIGTSTP, true
+	}
+	return 0, false
+}
+
 // receiveSignalChar handles a character that ISIG turns into sig, as
 // n_tty.c:n_tty_receive_signal_char() does: unless NOFLSH is set, the input and
-// output waiting are flushed (see flushForSignal); the character is not passed
-// to the reading process, the foreground process group gets sig, and with ECHO
-// set the character is echoed (as "^C" with ECHOCTL). It returns whether
-// anything was echoed.
+// output waiting are flushed (see flushForSignal); with IXON, stopped output
+// starts again; the character is not passed to the reading process, the
+// foreground process group gets sig, and with ECHO set the character is echoed
+// (as "^C" with ECHOCTL). It returns whether to notify master readers.
 //
 // The signal is sent once the echo is written (see flushEchoes).
 //
@@ -818,12 +860,13 @@ func (l *lineDiscipline) receiveSignalChar(cBytes []byte, sig linux.Signal) bool
 	if !l.termios.LEnabled(linux.NOFLSH) {
 		l.flushForSignal()
 	}
+	started := l.termios.IEnabled(linux.IXON) && l.startOutput()
 	l.signals = append(l.signals, sig)
 	echo := l.termios.LEnabled(linux.ECHO)
 	if echo {
 		l.echoChar(cBytes)
 	}
-	return echo
+	return echo || started
 }
 
 // flushForSignal discards what n_tty.c:isig() flushes when a signal character
@@ -848,6 +891,76 @@ func (l *lineDiscipline) flushForSignal() {
 	}
 	l.outQueue.mu.Unlock()
 	l.pendingPacketStatus |= linux.TIOCPKT_FLUSHREAD | linux.TIOCPKT_FLUSHWRITE
+}
+
+// stopOutput stops output, as tty_io.c:stop_tty() does on VSTOP under IXON:
+// until output starts again, the replica cannot write, the echoes of input
+// wait, and a packet mode master is told TIOCPKT_STOP (pty.c:pty_stop()).
+//
+// +checklocks:l.inQueue.mu
+// +checklocksexclude:l.outQueue.mu
+func (l *lineDiscipline) stopOutput() {
+	l.outQueue.mu.Lock()
+	defer l.outQueue.mu.Unlock()
+	if l.stopped {
+		return
+	}
+	l.stopped = true
+	l.pendingPacketStatus = mergePacketStatus(l.pendingPacketStatus, linux.TIOCPKT_STOP)
+}
+
+// startOutput starts output stopped by stopOutput, as tty_io.c:start_tty()
+// does: what waited reaches the master, replica writers resume, and a packet
+// mode master is told TIOCPKT_START (pty.c:pty_start()). It returns whether
+// output was stopped, in which case master readers are to be notified.
+//
+// +checklocksread:l.termiosMu
+// +checklocks:l.inQueue.mu
+// +checklocksexclude:l.outQueue.mu
+func (l *lineDiscipline) startOutput() bool {
+	l.outQueue.mu.Lock()
+	defer l.outQueue.mu.Unlock()
+	if !l.stopped {
+		return false
+	}
+	l.stopped = false
+	l.outQueue.pushWaitBufLocked(l)
+	l.pendingPacketStatus = mergePacketStatus(l.pendingPacketStatus, linux.TIOCPKT_START)
+	l.pendingReplicaEvents |= waiter.WritableEvents
+	return true
+}
+
+// restartOutputOnAny starts stopped output when IXON and IXANY are set, as
+// any input character but VSTOP does on Linux. It returns whether output was
+// stopped.
+//
+// +checklocksread:l.termiosMu
+// +checklocks:l.inQueue.mu
+// +checklocksexclude:l.outQueue.mu
+func (l *lineDiscipline) restartOutputOnAny() bool {
+	return l.termios.IEnabled(linux.IXON) && l.termios.IEnabled(linux.IXANY) && l.startOutput()
+}
+
+// outputStopped returns whether output is stopped (see stopOutput).
+//
+// +checklocksexclude:l.outQueue.mu
+func (l *lineDiscipline) outputStopped() bool {
+	l.outQueue.mu.Lock()
+	defer l.outQueue.mu.Unlock()
+	return l.stopped
+}
+
+// mergePacketStatus returns the TIOCPKT_* status old with status added.
+// TIOCPKT_START and TIOCPKT_STOP report the latest change of output flow, so
+// each replaces the other, as in pty.c:pty_start() and pty_stop().
+func mergePacketStatus(old, status uint8) uint8 {
+	if status&linux.TIOCPKT_START != 0 {
+		old &^= linux.TIOCPKT_STOP
+	}
+	if status&linux.TIOCPKT_STOP != 0 {
+		old &^= linux.TIOCPKT_START
+	}
+	return old | status
 }
 
 // echo queues b to be echoed. See echoBuf.
@@ -904,18 +1017,12 @@ func (l *lineDiscipline) notifyInputEvents() {
 // +checklocksread:l.termiosMu
 // +checklocks:l.inQueue.mu
 func (l *lineDiscipline) echoInput(cBytes []byte, crToNL bool) {
-	c := cBytes[0]
-	switch {
-	case c == '\n' && (crToNL || l.termios.LEnabled(linux.ICANON)):
-		// A line's newline is echoed as is, never as "^J".
+	// A line's newline is echoed as is, never as "^J".
+	if c := cBytes[0]; c == '\n' && (crToNL || l.termios.LEnabled(linux.ICANON)) {
 		l.echo(cBytes...)
-	case l.termios.IEnabled(linux.IXON) &&
-		(l.termios.IsControlChar(c, linux.VSTART) || l.termios.IsControlChar(c, linux.VSTOP)):
-		// With IXON, Linux consumes START and STOP as flow control
-		// (n_tty.c:n_tty_receive_char_flow_ctrl()) and never echoes them.
-	default:
-		l.echoChar(cBytes)
+		return
 	}
+	l.echoChar(cBytes)
 }
 
 // echoChar echoes cBytes as n_tty.c:echo_char() does: with ECHOCTL, a control
@@ -1020,7 +1127,7 @@ func (l *lineDiscipline) notifyPacketStatus(status uint8) {
 		l.termiosMu.Unlock()
 		return
 	}
-	l.packetStatus |= status
+	l.packetStatus = mergePacketStatus(l.packetStatus, status)
 	l.termiosMu.Unlock()
 	l.masterWaiter.Notify(waiter.EventPri | waiter.ReadableEvents)
 }

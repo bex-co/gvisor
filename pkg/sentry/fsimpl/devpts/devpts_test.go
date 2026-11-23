@@ -225,6 +225,8 @@ func TestEcho(t *testing.T) {
 		{name: "reprint", input: "a\x01\x12", echo: "a^A^R\r\na^A"},
 		{name: "ECHONL without ECHO", lflagsOn: linux.ECHONL, lflagsOff: linux.ECHO, input: "ab\r", echo: "\r\n", read: "ab\n"},
 		{name: "noncanonical literal next and reprint", lflagsOff: linux.ICANON, input: "\x16\x12", echo: "^V^R", read: "\x16\x12"},
+		{name: "stop and start", input: "\x13\x11a\n", echo: "a\r\n", read: "a\n"},
+		{name: "stop holds echoes", lflagsOff: linux.ICANON, input: "\x13ab", read: "ab"},
 		{name: "control characters", input: "a\x01\x1b\tb\n", echo: "a^A^[\tb\r\n", read: "a\x01\x1b\tb\n"},
 		{name: "control characters without ECHOCTL", lflagsOff: linux.ECHOCTL, input: "a\x01b\n", echo: "a\x01b\r\n", read: "a\x01b\n"},
 		{name: "carriage return", input: "\r", echo: "\r\n", read: "\n"},
@@ -250,4 +252,51 @@ func TestEcho(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestFlowControl checks that VSTOP and VSTART stop and start output under
+// IXON, as drivers/tty/n_tty.c and drivers/tty/pty.c do on Linux.
+func TestFlowControl(t *testing.T) {
+	ctx := contexttest.Context(t)
+	ld := newTestLineDiscipline(linux.DefaultReplicaTermios)
+	ld.setPacketMode(1)
+	typeInput := func(input string) {
+		t.Helper()
+		if _, err := ld.inputQueueWrite(ctx, usermem.BytesIOSequence([]byte(input))); err != nil {
+			t.Fatalf("inputQueueWrite(%q): %v", input, err)
+		}
+	}
+	expectRead := func(want string) {
+		t.Helper()
+		if got := readAvailable(t, ld.outputQueueRead); got != want {
+			t.Errorf("master read: got %q, want %q", got, want)
+		}
+	}
+	writeOutput := func() error {
+		_, err := ld.outputQueueWrite(ctx, usermem.BytesIOSequence([]byte("out")))
+		return err
+	}
+
+	typeInput("\x13")
+	expectRead(string([]byte{linux.TIOCPKT_STOP}))
+	if ld.replicaReadiness()&waiter.WritableEvents != 0 {
+		t.Errorf("replica is writable while output is stopped")
+	}
+	if err := writeOutput(); !linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
+		t.Errorf("outputQueueWrite while output is stopped: got %v, want %v", err, linuxerr.ErrWouldBlock)
+	}
+	// The echo waits for output to start.
+	typeInput("a")
+	expectRead("")
+
+	typeInput("\x11")
+	expectRead(string([]byte{linux.TIOCPKT_START}))
+	expectRead("\x00a")
+	if ld.replicaReadiness()&waiter.WritableEvents == 0 {
+		t.Errorf("replica is not writable once output starts")
+	}
+	if err := writeOutput(); err != nil {
+		t.Errorf("outputQueueWrite: %v", err)
+	}
+	expectRead("\x00out")
 }
