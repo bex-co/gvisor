@@ -425,3 +425,45 @@ func TestCanonicalTypeahead(t *testing.T) {
 		t.Fatalf("unexpected trailing data: %q", got)
 	}
 }
+
+// TestTCFlow checks TCXONC (TCOOFF/TCOON/TCIOFF/TCION) on replica and master.
+func TestTCFlow(t *testing.T) {
+	ctx := contexttest.Context(t)
+	ld := newTestLineDiscipline(linux.DefaultReplicaTermios)
+	ld.setPacketMode(1)
+
+	if err := ld.tcFlow(replicaEndpoint, linux.TCOOFF); err != nil {
+		t.Fatalf("tcFlow(TCOOFF): %v", err)
+	}
+	if got := readAvailable(t, ld.outputQueueRead); got != string([]byte{linux.TIOCPKT_STOP}) {
+		t.Fatalf("after TCOOFF packet: got %q, want TIOCPKT_STOP", got)
+	}
+	if _, err := ld.outputQueueWrite(ctx, usermem.BytesIOSequence([]byte("out"))); !linuxerr.Equals(linuxerr.ErrWouldBlock, err) {
+		t.Fatalf("outputQueueWrite under TCOOFF: got %v, want EAGAIN", err)
+	}
+	// VSTART does not override TCOOFF.
+	if _, err := ld.inputQueueWrite(ctx, usermem.BytesIOSequence([]byte("\x11"))); err != nil {
+		t.Fatalf("inputQueueWrite VSTART: %v", err)
+	}
+	if ld.replicaReadiness()&waiter.WritableEvents != 0 {
+		t.Fatalf("VSTART resumed output stopped by TCOOFF")
+	}
+	if err := ld.tcFlow(replicaEndpoint, linux.TCOON); err != nil {
+		t.Fatalf("tcFlow(TCOON): %v", err)
+	}
+	if got := readAvailable(t, ld.outputQueueRead); got != string([]byte{linux.TIOCPKT_START}) {
+		t.Fatalf("after TCOON packet: got %q, want TIOCPKT_START", got)
+	}
+	if ld.replicaReadiness()&waiter.WritableEvents == 0 {
+		t.Fatalf("replica not writable after TCOON")
+	}
+	if err := ld.tcFlow(replicaEndpoint, linux.TCIOFF); err != nil {
+		t.Fatalf("tcFlow(TCIOFF): %v", err)
+	}
+	if got := readAvailable(t, ld.outputQueueRead); got != "\x00\x13" {
+		t.Fatalf("after TCIOFF: got %q, want \\x00\\x13", got)
+	}
+	if err := ld.tcFlow(replicaEndpoint, 99); !linuxerr.Equals(linuxerr.EINVAL, err) {
+		t.Fatalf("tcFlow(99): got %v, want EINVAL", err)
+	}
+}

@@ -188,6 +188,8 @@ func (mfd *masterFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysn
 		// drain. For a pty with no real hardware, this is a no-op.
 		// TCSBRK with arg == 0 sends a break, also a no-op for ptys.
 		return 0, nil
+	case linux.TCXONC:
+		return 0, mfd.t.ld.tcFlow(masterEndpoint, args[2].Uint())
 	case linux.TCFLSH:
 		return 0, mfd.t.ld.tcFlush(masterEndpoint, args[2].Uint())
 	case linux.TIOCGPTN:

@@ -56,6 +56,7 @@ const (
 	TIOCGDEV    = 0x80045432
 	TIOCVHANGUP = 0x00005437
 	TIOCGPKT    = 0x80045438
+	TCXONC      = 0x0000540a
 	TCFLSH      = 0x0000540b
 	TIOCCONS    = 0x0000541d
 	TIOCSSERIAL = 0x0000541f
@@ -155,6 +156,14 @@ func IOC_NR(nr uint32) uint32 {
 func IOC_SIZE(nr uint32) uint32 {
 	return (nr >> IOC_SIZESHIFT) & ((1 << IOC_SIZEBITS) - 1)
 }
+
+// TCXONC flow control action arguments.
+const (
+	TCOOFF = 0
+	TCOON  = 1
+	TCIOFF = 2
+	TCION  = 3
+)
 
 // TCFLSH queue selector arguments.
 const (

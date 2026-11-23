@@ -2549,6 +2549,90 @@ TEST_F(PtyTest, EchoPrtNewlineAndSignalFlush) {
   ExpectReadExactly(replica_, "d\n");
 }
 
+// TCXONC TCOOFF stops replica output (even without IXON, and VSTART does not
+// override it) and TCOON resumes it, updating packet mode status and waking a
+// blocked writer.
+TEST_F(PtyTest, TcFlowOutputStopAndStart) {
+  // TCOOFF/TCOON work even when IXON is disabled.
+  struct kernel_termios t = DefaultTermios();
+  t.c_iflag &= ~IXON;
+  ASSERT_THAT(ioctl(replica_.get(), TCSETS, &t), SyscallSucceeds());
+  ASSERT_THAT(tcflow(replica_.get(), TCOOFF), SyscallSucceeds());
+  ASSERT_NO_ERRNO(WaitUntilWritable(replica_.get(), false));
+  char c = 'x';
+  EXPECT_THAT(WriteFd(replica_.get(), &c, 1), SyscallFailsWithErrno(EAGAIN));
+  ASSERT_THAT(tcflow(replica_.get(), TCOON), SyscallSucceeds());
+  ASSERT_NO_ERRNO(WaitUntilWritable(replica_.get(), true));
+
+  // Re-enable IXON, then enable packet mode and verify TCOOFF/TCOON status
+  // bytes, VSTART non-interference, and waking a blocked writer.
+  t.c_iflag |= IXON;
+  ASSERT_THAT(ioctl(replica_.get(), TCSETS, &t), SyscallSucceeds());
+  EnablePacketMode();
+
+  ASSERT_THAT(tcflow(replica_.get(), TCOOFF), SyscallSucceeds());
+  ExpectMasterPacketStatus(TIOCPKT_STOP);
+  ASSERT_NO_ERRNO(WaitUntilWritable(replica_.get(), false));
+  EXPECT_THAT(WriteFd(replica_.get(), &c, 1), SyscallFailsWithErrno(EAGAIN));
+
+  // VSTART does not override TCOOFF.
+  WriteAll(master_, std::string(1, ControlCharacter('Q')));
+  EXPECT_THAT(WriteFd(replica_.get(), &c, 1), SyscallFailsWithErrno(EAGAIN));
+
+  // A blocking writer wakes once TCOON is called.
+  FileDescriptor blocking_replica =
+      ASSERT_NO_ERRNO_AND_VALUE(OpenReplica(master_, O_RDWR | O_NOCTTY));
+  absl::Notification written;
+  int fd = blocking_replica.get();
+  ScopedThread th([fd, &written]() {
+    EXPECT_THAT(WriteFd(fd, "out", 3), SyscallSucceedsWithValue(3));
+    written.Notify();
+  });
+  EXPECT_FALSE(written.WaitForNotificationWithTimeout(absl::Seconds(1)));
+
+  ASSERT_THAT(tcflow(replica_.get(), TCOON), SyscallSucceeds());
+  ExpectMasterPacketStatus(TIOCPKT_START);
+  EXPECT_TRUE(written.WaitForNotificationWithTimeout(kTimeout));
+  th.Join();
+  ExpectEcho(master_, std::string("\0out", 4));
+}
+
+// TCXONC TCIOFF and TCION send VSTOP and VSTART on the replica's output queue
+// (omitted when disabled), and TCOOFF/TCOON on the master stop and start
+// master writes.
+TEST_F(PtyTest, TcFlowInputCharsAndMasterEndpoint) {
+  ASSERT_THAT(tcflow(replica_.get(), TCIOFF), SyscallSucceeds());
+  ASSERT_THAT(tcflow(replica_.get(), TCION), SyscallSucceeds());
+  ExpectEcho(master_, "\x13\x11");
+
+  // Disabled VSTOP/VSTART send nothing.
+  struct kernel_termios t = DefaultTermios();
+  t.c_cc[VSTOP] = _POSIX_VDISABLE;
+  t.c_cc[VSTART] = _POSIX_VDISABLE;
+  ASSERT_THAT(ioctl(replica_.get(), TCSETS, &t), SyscallSucceeds());
+  ASSERT_THAT(tcflow(replica_.get(), TCIOFF), SyscallSucceeds());
+  ASSERT_THAT(tcflow(replica_.get(), TCION), SyscallSucceeds());
+  ExpectFinished(master_);
+
+  // Master TCOOFF stops master writes without affecting replica writes.
+  ASSERT_THAT(tcflow(master_.get(), TCOOFF), SyscallSucceeds());
+  ASSERT_NO_ERRNO(WaitUntilWritable(master_.get(), false));
+  char c = 'a';
+  EXPECT_THAT(WriteFd(master_.get(), &c, 1), SyscallFailsWithErrno(EAGAIN));
+  WriteAll(replica_, "ok");
+  ExpectEcho(master_, "ok");
+
+  ASSERT_THAT(tcflow(master_.get(), TCOON), SyscallSucceeds());
+  ASSERT_NO_ERRNO(WaitUntilWritable(master_.get(), true));
+  TestCanonicalIO("hi\n", "hi\n", "hi\r\n");
+}
+
+// TCXONC rejects invalid actions with EINVAL on both endpoints.
+TEST_F(PtyTest, TcFlowInvalidAction) {
+  EXPECT_THAT(ioctl(replica_.get(), TCXONC, 99), SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(ioctl(master_.get(), TCXONC, 99), SyscallFailsWithErrno(EINVAL));
+}
+
 TEST_F(PtyTest, GetWindowSize) {
   struct winsize ws;
   ASSERT_THAT(ioctl(replica_.get(), TIOCGWINSZ, &ws), SyscallSucceeds());

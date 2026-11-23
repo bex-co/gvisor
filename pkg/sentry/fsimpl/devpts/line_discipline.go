@@ -165,6 +165,19 @@ type lineDiscipline struct {
 	// +checklocks:outQueue.mu
 	stopped bool
 
+	// tcoStopped is whether replica output was stopped by TCXONC TCOOFF, as
+	// tty_struct.flow.tco_stopped is on Linux. While true, only TCOON resumes
+	// output.
+	//
+	// +checklocks:outQueue.mu
+	tcoStopped bool
+
+	// masterStopped is whether master output (writes to inQueue) was stopped
+	// by TCXONC TCOOFF on the master fd.
+	//
+	// +checklocks:inQueue.mu
+	masterStopped bool
+
 	// echoBuf holds the echoes of the input being processed. They are written
 	// to outQueue once the input has been processed, as
 	// n_tty.c:flush_echoes() does at the end of n_tty_receive_buf(), so that
@@ -354,7 +367,11 @@ func (l *lineDiscipline) setWindowSize(t *kernel.Task, args arch.SyscallArgument
 // +checklocksexclude:l.outQueue.mu
 func (l *lineDiscipline) masterReadiness() waiter.EventMask {
 	// The master termios is immutable so termiosMu is not needed.
-	res := l.inQueue.writeReadiness(&linux.MasterTermios) | l.outQueue.readReadiness(&linux.MasterTermios)
+	var res waiter.EventMask
+	if !l.masterOutputStopped() {
+		res |= l.inQueue.writeReadiness(&linux.MasterTermios)
+	}
+	res |= l.outQueue.readReadiness(&linux.MasterTermios)
 	l.termiosMu.RLock()
 	if l.packet && l.packetStatus != 0 {
 		res |= waiter.EventPri | waiter.ReadableEvents
@@ -427,6 +444,10 @@ func (l *lineDiscipline) inputQueueWrite(ctx context.Context, src usermem.IOSequ
 		return 0, nil
 	}
 	l.termiosMu.RLock()
+	if l.masterOutputStopped() {
+		l.termiosMu.RUnlock()
+		return 0, linuxerr.ErrWouldBlock
+	}
 	n, notifyEcho, err := l.inQueue.write(ctx, src, l)
 	l.termiosMu.RUnlock()
 	l.notifyInputEvents()
@@ -1047,7 +1068,7 @@ func (l *lineDiscipline) stopOutput() {
 func (l *lineDiscipline) startOutput() bool {
 	l.outQueue.mu.Lock()
 	defer l.outQueue.mu.Unlock()
-	if !l.stopped {
+	if !l.stopped || l.tcoStopped {
 		return false
 	}
 	l.stopped = false
@@ -1075,6 +1096,16 @@ func (l *lineDiscipline) outputStopped() bool {
 	l.outQueue.mu.Lock()
 	defer l.outQueue.mu.Unlock()
 	return l.stopped
+}
+
+// masterOutputStopped returns whether master output was stopped by TCXONC
+// TCOOFF on the master fd.
+//
+// +checklocksexclude:l.inQueue.mu
+func (l *lineDiscipline) masterOutputStopped() bool {
+	l.inQueue.mu.Lock()
+	defer l.inQueue.mu.Unlock()
+	return l.masterStopped
 }
 
 // mergePacketStatus returns the TIOCPKT_* status old with status added.
@@ -1419,4 +1450,114 @@ func (l *lineDiscipline) tcFlush(endpoint ptyEndpoint, arg uint32) error {
 	}
 	l.notifyPacketStatus(l.packetStatusForFlush(endpoint, arg))
 	return nil
+}
+
+// tcFlow handles the TCXONC (tcflow(3)) ioctl from the perspective of the
+// calling PTY endpoint, matching drivers/tty/tty_ioctl.c:n_tty_ioctl_helper().
+//
+// +checklocksexclude:l.termiosMu
+// +checklocksexclude:l.inQueue.mu
+// +checklocksexclude:l.outQueue.mu
+// +checklocksexclude:l.masterWaiter.mu
+// +checklocksexclude:l.replicaWaiter.mu
+func (l *lineDiscipline) tcFlow(endpoint ptyEndpoint, arg uint32) error {
+	switch arg {
+	case linux.TCOOFF:
+		if endpoint == masterEndpoint {
+			l.inQueue.mu.Lock()
+			l.masterStopped = true
+			l.inQueue.mu.Unlock()
+			return nil
+		}
+		l.outQueue.mu.Lock()
+		wasStopped := l.stopped
+		l.tcoStopped = true
+		l.stopped = true
+		l.outQueue.mu.Unlock()
+		if !wasStopped {
+			l.notifyPacketStatus(linux.TIOCPKT_STOP)
+		}
+		return nil
+
+	case linux.TCOON:
+		if endpoint == masterEndpoint {
+			l.inQueue.mu.Lock()
+			wasStopped := l.masterStopped
+			l.masterStopped = false
+			l.inQueue.mu.Unlock()
+			if wasStopped {
+				l.masterWaiter.Notify(waiter.WritableEvents)
+			}
+			return nil
+		}
+		l.termiosMu.RLock()
+		l.outQueue.mu.Lock()
+		var resumed, notifyMaster bool
+		if l.tcoStopped {
+			l.tcoStopped = false
+			if l.stopped {
+				l.stopped = false
+				resumed = true
+				nPushed, _ := l.outQueue.pushWaitBufLocked(l)
+				notifyMaster = nPushed > 0
+			}
+		}
+		l.outQueue.mu.Unlock()
+		l.termiosMu.RUnlock()
+		if resumed {
+			l.notifyPacketStatus(linux.TIOCPKT_START)
+			if notifyMaster {
+				l.masterWaiter.Notify(waiter.ReadableEvents)
+			}
+			l.replicaWaiter.Notify(waiter.WritableEvents)
+		}
+		return nil
+
+	case linux.TCIOFF, linux.TCION:
+		ccIdx := linux.VSTOP
+		if arg == linux.TCION {
+			ccIdx = linux.VSTART
+		}
+		if endpoint == masterEndpoint {
+			ch := linux.MasterTermios.ControlCharacters[ccIdx]
+			if ch == 0 {
+				return nil
+			}
+			l.termiosMu.RLock()
+			if l.masterOutputStopped() {
+				l.termiosMu.RUnlock()
+				return nil
+			}
+			notifyEcho := l.inQueue.writeBytes([]byte{ch}, l)
+			l.termiosMu.RUnlock()
+			l.notifyInputEvents()
+			if notifyEcho {
+				l.masterWaiter.Notify(waiter.ReadableEvents)
+			}
+			l.replicaWaiter.Notify(waiter.ReadableEvents)
+			return nil
+		}
+		// On the replica endpoint, send_xchar writes the character directly to
+		// the master's read buffer (bypassing OPOST) unless replica output is
+		// stopped.
+		l.termiosMu.RLock()
+		ch := l.termios.ControlCharacters[ccIdx]
+		l.termiosMu.RUnlock()
+		if ch == 0 {
+			return nil
+		}
+		l.outQueue.mu.Lock()
+		if l.stopped || len(l.outQueue.readBuf) >= nonCanonMaxBytes {
+			l.outQueue.mu.Unlock()
+			return nil
+		}
+		l.outQueue.readBuf = append(l.outQueue.readBuf, ch)
+		l.outQueue.readable = true
+		l.outQueue.mu.Unlock()
+		l.masterWaiter.Notify(waiter.ReadableEvents)
+		return nil
+
+	default:
+		return linuxerr.EINVAL
+	}
 }
