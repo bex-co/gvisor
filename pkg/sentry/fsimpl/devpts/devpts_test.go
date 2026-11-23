@@ -367,3 +367,51 @@ func TestFlowControl(t *testing.T) {
 	}
 	expectRead("\x00out")
 }
+
+// TestCanonicalTypeahead checks that canonical input typed while completed
+// lines wait unread is processed immediately for echo, editing, EOF, and
+// signal flushes, and that reads return one line at a time.
+func TestCanonicalTypeahead(t *testing.T) {
+	ctx := contexttest.Context(t)
+	ld := newTestLineDiscipline(linux.DefaultReplicaTermios)
+
+	// Two completed lines plus a partial line: all echoed immediately, read
+	// one line per call.
+	if _, err := ld.inputQueueWrite(ctx, usermem.BytesIOSequence([]byte("ls\nab"))); err != nil {
+		t.Fatalf("inputQueueWrite: %v", err)
+	}
+	if got := readAvailable(t, ld.outputQueueRead); got != "ls\r\nab" {
+		t.Fatalf("echo of typeahead: got %q, want %q", got, "ls\r\nab")
+	}
+	// Ctrl-C flushes both the completed line and the partial line.
+	if _, err := ld.inputQueueWrite(ctx, usermem.BytesIOSequence([]byte("\x03"))); err != nil {
+		t.Fatalf("inputQueueWrite Ctrl-C: %v", err)
+	}
+	if got := readAvailable(t, ld.outputQueueRead); got != "^C" {
+		t.Fatalf("echo of Ctrl-C: got %q, want %q", got, "^C")
+	}
+	if got := readAvailable(t, ld.inputQueueRead); got != "" {
+		t.Fatalf("replica read after flush: got %q, want empty", got)
+	}
+
+	// EOF between lines and empty EOF line.
+	if _, err := ld.inputQueueWrite(ctx, usermem.BytesIOSequence([]byte("ab\x04cd\n\x04ef\n"))); err != nil {
+		t.Fatalf("inputQueueWrite EOF lines: %v", err)
+	}
+	if got := readAvailable(t, ld.outputQueueRead); got != "abcd\r\nef\r\n" {
+		t.Fatalf("echo of EOF lines: got %q, want %q", got, "abcd\r\nef\r\n")
+	}
+	for i, want := range []string{"ab", "cd\n", "", "ef\n"} {
+		buf := make([]byte, 64)
+		n, err := ld.inputQueueRead(ctx, usermem.BytesIOSequence(buf))
+		if err != nil {
+			t.Fatalf("read %d: unexpected err %v", i, err)
+		}
+		if got := string(buf[:n]); got != want {
+			t.Fatalf("read %d: got %q, want %q", i, got, want)
+		}
+	}
+	if got := readAvailable(t, ld.inputQueueRead); got != "" {
+		t.Fatalf("unexpected trailing data: %q", got)
+	}
+}

@@ -284,9 +284,17 @@ func (l *lineDiscipline) updateTermios(update func(*linux.KernelTermios)) {
 	// now readable. A VLNEXT applies only in canonical mode.
 	if old.LEnabled(linux.ICANON) && !l.termios.LEnabled(linux.ICANON) {
 		l.lnext = false
+		l.inQueue.lineEnds = nil
 		_, notifyMaster = l.inQueue.pushWaitBufLocked(l)
 		l.inQueue.readable = len(l.inQueue.readBuf) > 0
 		readable = true
+	} else if !old.LEnabled(linux.ICANON) && l.termios.LEnabled(linux.ICANON) {
+		// Bytes already buffered from noncanonical mode remain readable as a
+		// single chunk, matching n_tty.c:n_tty_set_termios().
+		if len(l.inQueue.readBuf) > 0 {
+			l.inQueue.lineEnds = []int{len(l.inQueue.readBuf)}
+			l.inQueue.readable = true
+		}
 	}
 	// Output stopped under IXON starts again when IXON is turned off.
 	if old.IEnabled(linux.IXON) && !l.termios.IEnabled(linux.IXON) {
@@ -373,31 +381,24 @@ func (l *lineDiscipline) inputQueueRead(ctx context.Context, dst usermem.IOSeque
 	l.termiosMu.RLock()
 	// Replica never reads in packet mode.
 	n, pushed, notifyEcho, err := l.inQueue.read(ctx, dst, l, false /* packet */)
-	isCanon := l.termios.LEnabled(linux.ICANON)
 	l.termiosMu.RUnlock()
 	l.notifyInputEvents()
 	if err != nil {
 		return 0, err
 	}
-	if n > 0 {
-		if notifyEcho {
+	if notifyEcho {
+		if n > 0 || pushed {
 			l.masterWaiter.Notify(waiter.ReadableEvents | waiter.WritableEvents)
 		} else {
-			l.masterWaiter.Notify(waiter.WritableEvents)
+			l.masterWaiter.Notify(waiter.ReadableEvents)
 		}
-		if pushed {
-			l.replicaWaiter.Notify(waiter.ReadableEvents)
-		}
-		return n, nil
+	} else if n > 0 || pushed {
+		l.masterWaiter.Notify(waiter.WritableEvents)
 	}
-	if notifyEcho {
-		l.masterWaiter.Notify(waiter.ReadableEvents)
+	if pushed {
+		l.replicaWaiter.Notify(waiter.ReadableEvents)
 	}
-	if !pushed && isCanon {
-		return 0, nil // EOF
-	}
-
-	return 0, linuxerr.ErrWouldBlock
+	return n, nil
 }
 
 // +checklocksexclude:l.termiosMu
@@ -645,12 +646,6 @@ type inputQueueTransformer struct{}
 // +checklocks:l.inQueue.mu
 // +checklocksexclude:l.outQueue.mu
 func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte) (int, bool) {
-	// If there's a line waiting to be read in canonical mode, don't write
-	// anything else to the read buffer.
-	if l.termios.LEnabled(linux.ICANON) && q.readable {
-		return 0, false
-	}
-
 	maxBytes := nonCanonMaxBytes
 	if l.termios.LEnabled(linux.ICANON) {
 		maxBytes = canonMaxBytes
@@ -658,18 +653,26 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 
 	var ret int
 	var notifyEcho bool
-	for len(buf) > 0 && len(q.readBuf) < canonMaxBytes {
+	for len(buf) > 0 {
 		size := l.peek(buf)
 		cBytes := append([]byte{}, buf[:size]...)
 		if l.lnext {
 			// The character after VLNEXT is not special and never ends the
-			// line. Like any such character, it is discarded once the line
-			// is full (see shouldDiscard).
+			// line. When completed lines already wait in readBuf, leave room in
+			// waitBuf if readBuf is full; otherwise discard once the line is
+			// full (see shouldDiscard).
+			if l.termios.LEnabled(linux.ICANON) && len(q.lineEnds) > 0 {
+				if len(q.readBuf)+size > nonCanonMaxBytes {
+					break
+				}
+			} else if !l.termios.LEnabled(linux.ICANON) && len(q.readBuf)+size > nonCanonMaxBytes {
+				break
+			}
 			l.lnext = false
 			notifyEcho = l.restartOutputOnAny() || notifyEcho
 			buf = buf[size:]
 			ret += size
-			if len(q.readBuf)+size >= canonMaxBytes {
+			if l.termios.LEnabled(linux.ICANON) && len(q.readBuf)+size >= canonMaxBytes {
 				continue
 			}
 			q.readBuf = append(q.readBuf, cBytes...)
@@ -744,14 +747,15 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 			case l.termios.IsControlChar(c, linux.VWERASE):
 				killType = linux.VWERASE
 			}
+			canonHead := q.canonHeadLocked()
 			// VKILL erases the whole line. Only with ECHO, ECHOK, ECHOKE
 			// and ECHOE all set is each character erased from the screen,
 			// as VERASE does with ECHOE. Otherwise the line is dropped and,
 			// with ECHO, the kill character is echoed, followed by a
 			// newline with ECHOK.
-			if killType == linux.VKILL && len(q.readBuf) > 0 && !(l.termios.LEnabled(linux.ECHO) &&
+			if killType == linux.VKILL && len(q.readBuf) > canonHead && !(l.termios.LEnabled(linux.ECHO) &&
 				l.termios.LEnabled(linux.ECHOK) && l.termios.LEnabled(linux.ECHOKE) && l.termios.LEnabled(linux.ECHOE)) {
-				q.readBuf = q.readBuf[:0]
+				q.readBuf = q.readBuf[:canonHead]
 				if l.termios.LEnabled(linux.ECHO) {
 					l.echoChar(cBytes)
 					if l.termios.LEnabled(linux.ECHOK) {
@@ -760,12 +764,12 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 				}
 			}
 			seenAlphanumeric := false
-			for len(q.readBuf) > 0 {
+			for len(q.readBuf) > canonHead {
 				// Erase a character. If IUTF8 is enabled, erase an entire multibyte unicode character.
 				var toErase byte
 				cnt := 0
 				isContinuationByte := true
-				for ; cnt < len(q.readBuf) && isContinuationByte; cnt++ {
+				for ; cnt < len(q.readBuf)-canonHead && isContinuationByte; cnt++ {
 					toErase = q.readBuf[len(q.readBuf)-cnt-1]
 					isContinuationByte = l.termios.IEnabled(linux.IUTF8) && (toErase&0xc0) == 0x80
 				}
@@ -851,7 +855,7 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 			// Echo the character, then the line typed so far on a new line.
 			l.echoChar(cBytes)
 			l.echo('\n')
-			for i := range q.readBuf {
+			for i := q.canonHeadLocked(); i < len(q.readBuf); i++ {
 				l.echoChar(q.readBuf[i : i+1])
 			}
 			buf = buf[size:]
@@ -860,24 +864,31 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 		}
 
 		// In canonical mode, we discard non-terminating characters
-		// after the first 4095.
+		// after the first 4095 when no completed line is waiting.
 		if l.shouldDiscard(q, cBytes) {
 			buf = buf[size:]
 			ret += size
 			continue
 		}
 
-		// Stop if the buffer would be overfilled.
-		if len(q.readBuf)+size > maxBytes {
+		// Stop if the buffer would be overfilled. When completed lines already
+		// wait in readBuf, keep typeahead in waitBuf once readBuf reaches
+		// nonCanonMaxBytes rather than discarding it.
+		if l.termios.LEnabled(linux.ICANON) && len(q.lineEnds) > 0 {
+			if len(q.readBuf)+size > nonCanonMaxBytes {
+				break
+			}
+		} else if len(q.readBuf)+size > maxBytes {
 			break
 		}
 		buf = buf[size:]
 		ret += size
 
-		// If we get EOF, make the buffer available for reading.
+		// If we get EOF, finish the line without storing the EOF character.
 		if l.termios.LEnabled(linux.ICANON) && l.termios.IsEOF(cBytes[0]) {
+			q.lineEnds = append(q.lineEnds, len(q.readBuf))
 			q.readable = true
-			break
+			continue
 		}
 
 		q.readBuf = append(q.readBuf, cBytes...)
@@ -892,10 +903,10 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 			notifyEcho = true
 		}
 
-		// If we finish a line, make it available for reading.
+		// If we finish a line, record its end and keep processing typeahead.
 		if l.termios.LEnabled(linux.ICANON) && l.termios.IsTerminating(cBytes) {
+			q.lineEnds = append(q.lineEnds, len(q.readBuf))
 			q.readable = true
-			break
 		}
 	}
 
@@ -959,6 +970,7 @@ func (l *lineDiscipline) receiveSignalChar(cBytes []byte, sig linux.Signal) bool
 func (l *lineDiscipline) flushForSignal() {
 	l.echoBuf = nil
 	l.inQueue.readBuf = l.inQueue.readBuf[:0]
+	l.inQueue.lineEnds = l.inQueue.lineEnds[:0]
 	l.inQueue.readable = false
 
 	l.outQueue.mu.Lock()
@@ -1132,7 +1144,7 @@ func isControl(c byte) bool {
 // +checklocksread:l.termiosMu
 // +checklocks:q.mu
 func (l *lineDiscipline) shouldDiscard(q *queue, cBytes []byte) bool {
-	return l.termios.LEnabled(linux.ICANON) && len(q.readBuf)+len(cBytes) >= canonMaxBytes && !l.termios.IsTerminating(cBytes)
+	return l.termios.LEnabled(linux.ICANON) && len(q.lineEnds) == 0 && len(q.readBuf)+len(cBytes) >= canonMaxBytes && !l.termios.IsTerminating(cBytes)
 }
 
 // peek returns the size in bytes of the next character to process. As long as
