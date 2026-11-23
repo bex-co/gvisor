@@ -2477,6 +2477,35 @@ TEST_F(PtyTest, TypeaheadEditBoundedToCurrentLine) {
   ExpectFinished(replica_);
 }
 
+// Erasing a tab moves the cursor back to the column where the tab began,
+// matching Linux's n_tty.c:ECHO_OP_ERASE_TAB.
+TEST_F(PtyTest, EraseTabAtVariousColumns) {
+  TestCanonicalIO("\t\x7f\n", "\n", "\t\b\b\b\b\b\b\b\b\r\n");
+  TestCanonicalIO("a\t\x7f\n", "a\n", "a\t\b\b\b\b\b\b\b\r\n");
+  TestCanonicalIO("1234567\t\x7f\n", "1234567\n", "1234567\t\b\r\n");
+  TestCanonicalIO("12345678\t\x7f\n", "12345678\n",
+                  "12345678\t\b\b\b\b\b\b\b\b\r\n");
+  TestCanonicalIO("\t\t\x7f\x7f\n", "\n",
+                  "\t\t\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\r\n");
+}
+
+// Erasing a tab accounts for replica output written before the line began.
+TEST_F(PtyTest, EraseTabAfterReplicaOutput) {
+  WriteAll(replica_, "hello\n$ ");
+  ExpectEcho(master_, "hello\r\n$ ");
+  TestCanonicalIO("\t\x7f\n", "\n", "\t\b\b\b\b\b\b\r\n");
+}
+
+// Control characters count as two columns with ECHOCTL and zero without it,
+// and VKILL erases tabs along with surrounding characters.
+TEST_F(PtyTest, EraseTabWithControlCharsAndKill) {
+  TestCanonicalIO("\x01\t\x7f\n", "\x01\n", "^A\t\b\b\b\b\b\b\r\n");
+  TestCanonicalIO("a\tb\x15\n", "\n", "a\tb\b \b\b\b\b\b\b\b\b\b \b\r\n");
+
+  SetLocalFlags(replica_, 0, ECHOCTL);
+  TestCanonicalIO("\x01\t\x7f\n", "\x01\n", "\x01\t\b\b\b\b\b\b\b\b\r\n");
+}
+
 TEST_F(PtyTest, GetWindowSize) {
   struct winsize ws;
   ASSERT_THAT(ioctl(replica_.get(), TIOCGWINSZ, &ws), SyscallSucceeds());
