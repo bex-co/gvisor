@@ -58,17 +58,35 @@ type queue struct {
 	// so readable must be checked.
 	readable bool
 
+	// lineEnds holds the end offsets in readBuf of each completed canonical
+	// line, including zero-length EOF lines (which have lineEnds[i] equal to
+	// the preceding line end or 0). It is non-empty only for the input queue in
+	// canonical mode.
+	lineEnds []int
+
 	// transform is the queue's function for transforming bytes
 	// entering the queue. For example, transform might convert all '\r's
 	// entering the queue to '\n's.
 	transformer
 }
 
+// canonHeadLocked returns the end offset in readBuf of the last completed
+// canonical line, or 0 if none is queued. Bytes at or after canonHeadLocked
+// belong to the line currently being typed.
+//
+// +checklocks:q.mu
+func (q *queue) canonHeadLocked() int {
+	if len(q.lineEnds) == 0 {
+		return 0
+	}
+	return q.lineEnds[len(q.lineEnds)-1]
+}
+
 // readReadiness returns whether q is ready to be read from.
 func (q *queue) readReadiness(t *linux.KernelTermios) waiter.EventMask {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if len(q.readBuf) > 0 && q.readable {
+	if q.readable && (len(q.readBuf) > 0 || len(q.lineEnds) > 0) {
 		return waiter.ReadableEvents
 	}
 	return waiter.EventMask(0)
@@ -90,7 +108,11 @@ func (q *queue) readableSize(t *kernel.Task, io usermem.IO, args arch.SyscallArg
 	defer q.mu.Unlock()
 	size := primitive.Int32(0)
 	if q.readable {
-		size = primitive.Int32(len(q.readBuf))
+		if len(q.lineEnds) > 0 {
+			size = primitive.Int32(q.lineEnds[len(q.lineEnds)-1])
+		} else {
+			size = primitive.Int32(len(q.readBuf))
+		}
 	}
 
 	_, err := size.CopyOut(t, args[2].Pointer())
@@ -132,23 +154,42 @@ func (q *queue) read(ctx context.Context, dst usermem.IOSequence, l *lineDiscipl
 		dst = dst.TakeFirst(canonMaxBytes)
 	}
 
-	n, err := dst.CopyOutFrom(ctx, safemem.ReaderFunc(func(dst safemem.BlockSeq) (uint64, error) {
-		src := safemem.BlockSeqOf(safemem.BlockFromSafeSlice(q.readBuf))
-		n, err := safemem.CopySeq(dst, src)
+	var n int64
+	if len(q.lineEnds) > 0 && q.lineEnds[0] == 0 {
+		// Empty EOF line: consume the marker and return 0 bytes.
+		q.lineEnds = q.lineEnds[1:]
+		q.readable = len(q.lineEnds) > 0
+	} else {
+		var err error
+		n, err = dst.CopyOutFrom(ctx, safemem.ReaderFunc(func(dst safemem.BlockSeq) (uint64, error) {
+			readSlice := q.readBuf
+			if len(q.lineEnds) > 0 {
+				readSlice = readSlice[:q.lineEnds[0]]
+			}
+			src := safemem.BlockSeqOf(safemem.BlockFromSafeSlice(readSlice))
+			n, err := safemem.CopySeq(dst, src)
+			if err != nil {
+				return 0, err
+			}
+			q.readBuf = q.readBuf[n:]
+			if len(q.lineEnds) > 0 {
+				if int(n) == q.lineEnds[0] {
+					q.lineEnds = q.lineEnds[1:]
+				}
+				for i := range q.lineEnds {
+					q.lineEnds[i] -= int(n)
+				}
+				q.readable = len(q.lineEnds) > 0
+			} else if len(q.readBuf) == 0 {
+				// If we read everything, this queue is no longer readable.
+				q.readable = false
+			}
+
+			return n, nil
+		}))
 		if err != nil {
-			return 0, err
+			return 0, false, false, err
 		}
-		q.readBuf = q.readBuf[n:]
-
-		// If we read everything, this queue is no longer readable.
-		if len(q.readBuf) == 0 {
-			q.readable = false
-		}
-
-		return n, nil
-	}))
-	if err != nil {
-		return 0, false, false, err
 	}
 
 	// Move data from the queue's wait buffer to its read buffer.
@@ -262,6 +303,7 @@ func (q *queue) flush() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.readBuf = nil
+	q.lineEnds = nil
 	q.readable = false
 	q.waitBuf = nil
 	q.waitBufLen = 0

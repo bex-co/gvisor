@@ -2162,6 +2162,155 @@ TEST_F(PtyTest, StopCharThenClearingIXONRestarts) {
   ExpectEcho(master_, "out");
 }
 
+// Input typed ahead while complete lines wait unread in canonical mode is
+// echoed immediately, FIONREAD counts only completed lines, and each read
+// returns one line at a time.
+TEST_F(PtyTest, TypeaheadEchoAndReadPerLine) {
+  WriteAll(master_, "ab\ncd\nef");
+  ExpectEcho(master_, "ab\r\ncd\r\nef");
+
+  int buffered = -1;
+  ASSERT_THAT(ioctl(replica_.get(), FIONREAD, &buffered), SyscallSucceeds());
+  EXPECT_EQ(buffered, 6);
+
+  char buf[16] = {};
+  ASSERT_THAT(RetryEINTR(read)(replica_.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(3));
+  EXPECT_EQ(std::string(buf, 3), "ab\n");
+  ASSERT_THAT(ioctl(replica_.get(), FIONREAD, &buffered), SyscallSucceeds());
+  EXPECT_EQ(buffered, 3);
+
+  ASSERT_THAT(RetryEINTR(read)(replica_.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(3));
+  EXPECT_EQ(std::string(buf, 3), "cd\n");
+  ASSERT_THAT(ioctl(replica_.get(), FIONREAD, &buffered), SyscallSucceeds());
+  EXPECT_EQ(buffered, 0);
+  ExpectFinished(replica_);
+
+  WriteAll(master_, "\n");
+  ExpectEcho(master_, "\r\n");
+  ASSERT_NO_ERRNO(WaitUntilReceived(replica_.get(), 3));
+  ExpectReadExactly(replica_, "ef\n");
+}
+
+// A partial read of the first queued canonical line leaves the rest of that
+// line for the next read without merging it with the following line.
+TEST_F(PtyTest, TypeaheadPartialReadAndFIONREAD) {
+  WriteAll(master_, "hello\nworld\n");
+  ExpectEcho(master_, "hello\r\nworld\r\n");
+
+  int buffered = -1;
+  ASSERT_THAT(ioctl(replica_.get(), FIONREAD, &buffered), SyscallSucceeds());
+  EXPECT_EQ(buffered, 12);
+
+  char buf[16] = {};
+  ASSERT_THAT(RetryEINTR(read)(replica_.get(), buf, 2),
+              SyscallSucceedsWithValue(2));
+  EXPECT_EQ(std::string(buf, 2), "he");
+  ASSERT_THAT(ioctl(replica_.get(), FIONREAD, &buffered), SyscallSucceeds());
+  EXPECT_EQ(buffered, 10);
+
+  ASSERT_THAT(RetryEINTR(read)(replica_.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(4));
+  EXPECT_EQ(std::string(buf, 4), "llo\n");
+  ASSERT_THAT(ioctl(replica_.get(), FIONREAD, &buffered), SyscallSucceeds());
+  EXPECT_EQ(buffered, 6);
+
+  ASSERT_THAT(RetryEINTR(read)(replica_.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(6));
+  EXPECT_EQ(std::string(buf, 6), "world\n");
+  ASSERT_THAT(ioctl(replica_.get(), FIONREAD, &buffered), SyscallSucceeds());
+  EXPECT_EQ(buffered, 0);
+  ExpectFinished(replica_);
+}
+
+// Ctrl-C after an unread complete line and a partial line echoes immediately
+// and flushes every queued line.
+TEST_F(PtyTest, TypeaheadSignalFlushesAllLines) {
+  WriteAll(master_, "ls\n");
+  ExpectEcho(master_, "ls\r\n");
+  WriteAll(master_, "ab");
+  ExpectEcho(master_, "ab");
+  WriteAll(master_, std::string(1, ControlCharacter('C')));
+  ExpectEcho(master_, "^C");
+  ExpectFinished(replica_);
+}
+
+// VSTOP typed after an unread complete line stops output at once rather than
+// waiting for the line to be read.
+TEST_F(PtyTest, TypeaheadStopCharHoldsOutput) {
+  WriteAll(master_, "line1\n");
+  ExpectEcho(master_, "line1\r\n");
+  WriteAll(master_, "ab\x13");
+  ASSERT_NO_ERRNO(WaitUntilWritable(replica_.get(), false));
+  ExpectFinished(master_);
+
+  WriteAll(master_, "\x11" "c\n");
+  ASSERT_NO_ERRNO(WaitUntilWritable(replica_.get(), true));
+  ExpectEcho(master_, "abc\r\n");
+
+  char buf[16] = {};
+  ASSERT_THAT(RetryEINTR(read)(replica_.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(6));
+  EXPECT_EQ(std::string(buf, 6), "line1\n");
+  ASSERT_THAT(RetryEINTR(read)(replica_.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(4));
+  EXPECT_EQ(std::string(buf, 4), "abc\n");
+  ExpectFinished(replica_);
+}
+
+// VEOF between lines ends the preceding line without storing the EOF byte,
+// and an empty EOF produces a zero-byte read between lines.
+TEST_F(PtyTest, TypeaheadEOFBetweenLines) {
+  WriteAll(master_, "ab\x04" "cd\n\x04" "ef\n");
+  ExpectEcho(master_, "abcd\r\nef\r\n");
+
+  int buffered = -1;
+  ASSERT_THAT(ioctl(replica_.get(), FIONREAD, &buffered), SyscallSucceeds());
+  EXPECT_EQ(buffered, 8);
+
+  char buf[16] = {};
+  ASSERT_THAT(RetryEINTR(read)(replica_.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(2));
+  EXPECT_EQ(std::string(buf, 2), "ab");
+  ASSERT_THAT(ioctl(replica_.get(), FIONREAD, &buffered), SyscallSucceeds());
+  EXPECT_EQ(buffered, 6);
+
+  ASSERT_THAT(RetryEINTR(read)(replica_.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(3));
+  EXPECT_EQ(std::string(buf, 3), "cd\n");
+  ASSERT_THAT(ioctl(replica_.get(), FIONREAD, &buffered), SyscallSucceeds());
+  EXPECT_EQ(buffered, 3);
+
+  ASSERT_THAT(RetryEINTR(read)(replica_.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(0));
+  ASSERT_THAT(ioctl(replica_.get(), FIONREAD, &buffered), SyscallSucceeds());
+  EXPECT_EQ(buffered, 3);
+
+  ASSERT_THAT(RetryEINTR(read)(replica_.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(3));
+  EXPECT_EQ(std::string(buf, 3), "ef\n");
+  ASSERT_THAT(ioctl(replica_.get(), FIONREAD, &buffered), SyscallSucceeds());
+  EXPECT_EQ(buffered, 0);
+  ExpectFinished(replica_);
+}
+
+// VERASE, VKILL, and VREPRINT stay within the current line and never touch an
+// unread completed line ahead of it.
+TEST_F(PtyTest, TypeaheadEditBoundedToCurrentLine) {
+  WriteAll(master_, "ab\ncd\x7f\x7f\x7f\x15\x12" "e\n");
+  ExpectEcho(master_, "ab\r\ncd\b \b\b \b^R\r\ne\r\n");
+
+  char buf[16] = {};
+  ASSERT_THAT(RetryEINTR(read)(replica_.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(3));
+  EXPECT_EQ(std::string(buf, 3), "ab\n");
+  ASSERT_THAT(RetryEINTR(read)(replica_.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(2));
+  EXPECT_EQ(std::string(buf, 2), "e\n");
+  ExpectFinished(replica_);
+}
+
 TEST_F(PtyTest, GetWindowSize) {
   struct winsize ws;
   ASSERT_THAT(ioctl(replica_.get(), TIOCGWINSZ, &ws), SyscallSucceeds());
@@ -3257,6 +3406,60 @@ TEST_F(JobControlTest, SignalCharSignalsForegroundAndEchoes) {
     EXPECT_EQ(c, sc.signal);
     ExpectEcho(master_, sc.echo);
   }
+  close(sync_pipe[0]);
+
+  int wstatus;
+  ASSERT_THAT(waitpid(child, &wstatus, 0), SyscallSucceedsWithValue(child));
+  ASSERT_TRUE(WIFEXITED(wstatus)) << wstatus;
+  EXPECT_EQ(WEXITSTATUS(wstatus), 0);
+}
+
+// Typing a line ahead and then Ctrl-C while the foreground process is not
+// reading its terminal echoes the typeahead and interrupts it immediately.
+TEST_F(JobControlTest, TypeaheadSignalInterruptsForeground) {
+  int sync_pipe[2];
+  ASSERT_THAT(pipe(sync_pipe), SyscallSucceeds());
+
+  pid_t child = fork();
+  if (child == 0) {
+    close(sync_pipe[0]);
+    master_.reset();
+
+    TEST_PCHECK(setsid() >= 0);
+    TEST_PCHECK(ioctl(replica_.get(), TIOCSCTTY, 0) >= 0);
+
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    TEST_PCHECK(sigprocmask(SIG_BLOCK, &set, nullptr) == 0);
+
+    char c = 'r';
+    TEST_PCHECK(WriteFd(sync_pipe[1], &c, 1) == 1);
+
+    struct timespec timeout = {};
+    timeout.tv_sec = 10;
+    int sig = RetryEINTR(sigtimedwait)(&set, nullptr, &timeout);
+    TEST_PCHECK(sig == SIGINT);
+    c = sig;
+    TEST_PCHECK(WriteFd(sync_pipe[1], &c, 1) == 1);
+    _exit(0);
+  }
+  ASSERT_GT(child, 0);
+  close(sync_pipe[1]);
+
+  char c;
+  ASSERT_THAT(ReadFd(sync_pipe[0], &c, 1), SyscallSucceedsWithValue(1));
+  EXPECT_EQ(c, 'r');
+
+  WriteAll(master_, "ls\n");
+  ExpectEcho(master_, "ls\r\n");
+  WriteAll(master_, "ab");
+  ExpectEcho(master_, "ab");
+  WriteAll(master_, std::string(1, ControlCharacter('C')));
+  ASSERT_THAT(ReadFd(sync_pipe[0], &c, 1), SyscallSucceedsWithValue(1));
+  EXPECT_EQ(c, SIGINT);
+  ExpectEcho(master_, "^C");
+  ExpectFinished(replica_);
   close(sync_pipe[0]);
 
   int wstatus;
