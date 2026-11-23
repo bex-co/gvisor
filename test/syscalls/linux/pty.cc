@@ -1947,6 +1947,50 @@ TEST_F(PtyTest, FlowControlCharsNotEchoedWithIXON) {
   ExpectEcho(master_, "x");
 }
 
+// Verifies that fd reads back exactly expected, which may contain NUL bytes,
+// and nothing after it.
+void ExpectReadExactly(const FileDescriptor& fd, const std::string& expected) {
+  std::string buf(expected.size(), 'x');
+  ExpectReadable(fd, expected.size(), &buf[0]);
+  EXPECT_EQ(buf, expected);
+  ExpectFinished(fd);
+}
+
+// Writes input to fd, which may contain NUL bytes.
+void WriteAll(const FileDescriptor& fd, const std::string& input) {
+  ASSERT_THAT(WriteFd(fd.get(), input.data(), input.size()),
+              SyscallSucceedsWithValue(input.size()));
+}
+
+// A control character set to _POSIX_VDISABLE (0) matches no input, so a NUL
+// byte is an ordinary character even when VINTR is disabled. This matches
+// n_tty.c:n_tty_set_termios(), which never maps __DISABLED_CHAR.
+TEST_F(PtyTest, DisabledCharSignalIsOrdinary) {
+  struct kernel_termios t = DefaultTermios();
+  t.c_lflag &= ~ICANON;
+  t.c_cc[VINTR] = _POSIX_VDISABLE;
+  ASSERT_THAT(ioctl(replica_.get(), TCSETS, &t), SyscallSucceeds());
+
+  WriteAll(master_, std::string(1, '\0'));
+  ExpectEcho(master_, "^@");
+  ExpectReadExactly(replica_, std::string(1, '\0'));
+}
+
+// The same holds for every special character in canonical mode.
+TEST_F(PtyTest, DisabledCharsAreOrdinary) {
+  struct kernel_termios t = DefaultTermios();
+  for (int cc : {VINTR, VQUIT, VSUSP, VERASE, VKILL, VWERASE, VLNEXT, VREPRINT,
+                 VSTART, VSTOP}) {
+    t.c_cc[cc] = _POSIX_VDISABLE;
+  }
+  ASSERT_THAT(ioctl(replica_.get(), TCSETS, &t), SyscallSucceeds());
+
+  const std::string line("a\0b\n", 4);
+  WriteAll(master_, line);
+  ExpectEcho(master_, "a^@b\r\n");
+  ExpectReadExactly(replica_, line);
+}
+
 TEST_F(PtyTest, GetWindowSize) {
   struct winsize ws;
   ASSERT_THAT(ioctl(replica_.get(), TIOCGWINSZ, &ws), SyscallSucceeds());
