@@ -513,8 +513,9 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 		// into a newline.
 		crToNL := false
 		// We're guaranteed that cBytes has at least one element.
-		switch cBytes[0] {
-		case '\r':
+		c := cBytes[0]
+		switch {
+		case c == '\r':
 			if l.termios.IEnabled(linux.IGNCR) {
 				buf = buf[size:]
 				ret += size
@@ -524,25 +525,25 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 				cBytes[0] = '\n'
 				crToNL = true
 			}
-		case '\n':
+		case c == '\n':
 			if l.termios.IEnabled(linux.INLCR) {
 				cBytes[0] = '\r'
 			}
-		case l.termios.ControlCharacters[linux.VINTR]: // ctrl-c
+		case l.termios.IsControlChar(c, linux.VINTR): // ctrl-c
 			if l.termios.LEnabled(linux.ISIG) {
 				notifyEcho = l.receiveSignalChar(cBytes, linux.SIGINT) || notifyEcho
 				buf = buf[size:]
 				ret += size
 				continue
 			}
-		case l.termios.ControlCharacters[linux.VSUSP]: // ctrl-z
+		case l.termios.IsControlChar(c, linux.VSUSP): // ctrl-z
 			if l.termios.LEnabled(linux.ISIG) {
 				notifyEcho = l.receiveSignalChar(cBytes, linux.SIGTSTP) || notifyEcho
 				buf = buf[size:]
 				ret += size
 				continue
 			}
-		case l.termios.ControlCharacters[linux.VQUIT]: // ctrl-\
+		case l.termios.IsControlChar(c, linux.VQUIT): // ctrl-\
 			if l.termios.LEnabled(linux.ISIG) {
 				notifyEcho = l.receiveSignalChar(cBytes, linux.SIGQUIT) || notifyEcho
 				buf = buf[size:]
@@ -553,19 +554,18 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 		// In canonical mode, some characters need to be handled specially; for example, backspace.
 		// This roughly aligns with n_tty.c:n_tty_receive_char_canon and n_tty.c:eraser
 		// cBytes[0] == ControlCharacters[linux.VKILL] is also handled by n_tty.c:eraser, but this isn't implemented
-		case l.termios.ControlCharacters[linux.VWERASE]:
+		case l.termios.IsControlChar(c, linux.VWERASE):
 			if !l.termios.LEnabled(linux.IEXTEN) {
 				break
 			}
 			fallthrough
-		case l.termios.ControlCharacters[linux.VERASE]:
+		case l.termios.IsControlChar(c, linux.VERASE):
 			if !l.termios.LEnabled(linux.ICANON) {
 				break
 			}
 
-			c := cBytes[0]
 			killType := linux.VERASE
-			if c == l.termios.ControlCharacters[linux.VWERASE] {
+			if l.termios.IsControlChar(c, linux.VWERASE) {
 				killType = linux.VWERASE
 			}
 			seenAlphanumeric := false
@@ -716,8 +716,8 @@ func (l *lineDiscipline) echoInput(cBytes []byte, crToNL bool) {
 	case c == '\n' && (crToNL || l.termios.LEnabled(linux.ICANON)):
 		// A line's newline is echoed as is, never as "^J".
 		l.outQueue.writeBytes(cBytes, l)
-	case l.termios.IEnabled(linux.IXON) && c != 0 &&
-		(c == l.termios.ControlCharacters[linux.VSTART] || c == l.termios.ControlCharacters[linux.VSTOP]):
+	case l.termios.IEnabled(linux.IXON) &&
+		(l.termios.IsControlChar(c, linux.VSTART) || l.termios.IsControlChar(c, linux.VSTOP)):
 		// With IXON, Linux consumes START and STOP as flow control
 		// (n_tty.c:n_tty_receive_char_flow_ctrl()) and never echoes them.
 	default:

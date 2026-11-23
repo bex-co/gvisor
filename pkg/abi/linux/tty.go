@@ -119,26 +119,21 @@ func (t *KernelTermios) IsTerminating(cBytes []byte) bool {
 		return false
 	}
 	c := cBytes[0]
-
-	// Is this the user-set EOF character?
-	if t.IsEOF(c) {
-		return true
-	}
-
-	switch c {
-	case disabledChar:
-		return false
-	case '\n', t.ControlCharacters[VEOL]:
-		return true
-	case t.ControlCharacters[VEOL2]:
-		return t.LEnabled(IEXTEN)
-	}
-	return false
+	return c == '\n' || t.IsEOF(c) || t.IsControlChar(c, VEOL) ||
+		(t.IsControlChar(c, VEOL2) && t.LEnabled(IEXTEN))
 }
 
 // IsEOF returns whether c is the EOF character.
 func (t *KernelTermios) IsEOF(c byte) bool {
-	return c == t.ControlCharacters[VEOF] && t.ControlCharacters[VEOF] != disabledChar
+	return t.IsControlChar(c, VEOF)
+}
+
+// IsControlChar returns whether c is the control character at index i of
+// ControlCharacters, such as VINTR. A disabled control character matches no
+// input: Linux never treats __DISABLED_CHAR as special (see
+// drivers/tty/n_tty.c:n_tty_set_termios()).
+func (t *KernelTermios) IsControlChar(c byte, i int) bool {
+	return c != disabledChar && c == t.ControlCharacters[i]
 }
 
 // Input flags.
