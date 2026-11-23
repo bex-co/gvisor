@@ -233,6 +233,11 @@ func TestEcho(t *testing.T) {
 		{name: "noncanonical newline", lflagsOff: linux.ICANON, input: "\n", echo: "^J", read: "\n"},
 		{name: "noncanonical carriage return", lflagsOff: linux.ICANON, input: "\r", echo: "\r\n", read: "\n"},
 		{name: "noncanonical delete", lflagsOff: linux.ICANON, input: "\x7f", echo: "^?", read: "\x7f"},
+		{name: "erase tab at column 0", input: "\t\x7f\n", echo: "\t\b\b\b\b\b\b\b\b\r\n", read: "\n"},
+		{name: "erase tab at column 1", input: "a\t\x7f\n", echo: "a\t\b\b\b\b\b\b\b\r\n", read: "a\n"},
+		{name: "erase tab after control char", input: "\x01\t\x7f\n", echo: "^A\t\b\b\b\b\b\b\r\n", read: "\x01\n"},
+		{name: "erase tab after control char without ECHOCTL", lflagsOff: linux.ECHOCTL, input: "\x01\t\x7f\n", echo: "\x01\t\b\b\b\b\b\b\b\b\r\n", read: "\x01\n"},
+		{name: "kill line containing tab", input: "a\tb\x15\n", echo: "a\tb\b \b\b\b\b\b\b\b\b\b \b\r\n", read: "\n"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			termios := linux.DefaultReplicaTermios

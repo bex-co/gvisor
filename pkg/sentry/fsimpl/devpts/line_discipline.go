@@ -135,6 +135,12 @@ type lineDiscipline struct {
 	// +checklocks:inQueue.mu
 	lnext bool
 
+	// canonColumn is the cursor column at the start of the current canonical
+	// line, used to compute how many columns an erased tab spanned.
+	//
+	// +checklocks:inQueue.mu
+	canonColumn int
+
 	// stopped is whether output is stopped, as tty_struct.flow.stopped is on
 	// Linux (see stopOutput).
 	//
@@ -492,7 +498,7 @@ Outer:
 	cByteSwitch:
 		switch cBytes[0] {
 		case '\n':
-			if l.termios.OEnabled(linux.ONLRET) {
+			if l.termios.OEnabled(linux.ONLRET) || l.termios.OEnabled(linux.ONLCR) {
 				l.column = 0
 			}
 			if l.termios.OEnabled(linux.ONLCR) {
@@ -520,12 +526,12 @@ Outer:
 		case '\t':
 			spaces := spacesPerTab - l.column%spacesPerTab
 			if l.termios.OutputFlags&linux.TABDLY == linux.XTABS {
-				if sizeBudget < spacesPerTab {
+				if sizeBudget < spaces {
 					break Outer
 				}
 				ret += size
 				l.column += spaces
-				q.readBuf = append(q.readBuf, bytes.Repeat([]byte{' '}, spacesPerTab)...)
+				q.readBuf = append(q.readBuf, bytes.Repeat([]byte{' '}, spaces)...)
 				continue Outer
 			}
 			l.column += spaces
@@ -534,7 +540,9 @@ Outer:
 				l.column--
 			}
 		default:
-			l.column++
+			if !isControl(cBytes[0]) {
+				l.column++
+			}
 		}
 		ret += size
 		q.readBuf = append(q.readBuf, cBytes...)
@@ -596,6 +604,9 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 			ret += size
 			if l.termios.LEnabled(linux.ICANON) && len(q.readBuf)+size >= canonMaxBytes {
 				continue
+			}
+			if l.termios.LEnabled(linux.ICANON) && len(q.readBuf) == q.canonHeadLocked() {
+				l.syncCanonColumn()
 			}
 			q.readBuf = append(q.readBuf, cBytes...)
 			if l.termios.LEnabled(linux.ECHO) {
@@ -719,7 +730,7 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 						// instead of erasing the character from the screen.
 						l.echoChar(cBytes)
 					} else if toErase == '\t' {
-						// Not implemented
+						l.eraseTab(q.readBuf[canonHead:])
 					} else {
 						isCtrl := isControl(toErase)
 						echoctl := l.termios.LEnabled(linux.ECHOCTL)
@@ -777,6 +788,7 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 			// Echo the character, then the line typed so far on a new line.
 			l.echoChar(cBytes)
 			l.echo('\n')
+			l.syncCanonColumn()
 			for i := q.canonHeadLocked(); i < len(q.readBuf); i++ {
 				l.echoChar(q.readBuf[i : i+1])
 			}
@@ -813,6 +825,9 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 			continue
 		}
 
+		if l.termios.LEnabled(linux.ICANON) && len(q.readBuf) == q.canonHeadLocked() {
+			l.syncCanonColumn()
+		}
 		q.readBuf = append(q.readBuf, cBytes...)
 
 		// Anything written to the readBuf will have to be echoed.
@@ -980,6 +995,88 @@ func mergePacketStatus(old, status uint8) uint8 {
 // +checklocks:l.inQueue.mu
 func (l *lineDiscipline) echo(b ...byte) {
 	l.echoBuf = append(l.echoBuf, b...)
+}
+
+// advanceColumn returns the cursor column after buf is processed by the output
+// queue under l.termios.
+//
+// +checklocksread:l.termiosMu
+func (l *lineDiscipline) advanceColumn(col int, buf []byte) int {
+	if !l.termios.OEnabled(linux.OPOST) {
+		return col
+	}
+	for len(buf) > 0 {
+		size := l.peek(buf)
+		c := buf[0]
+		buf = buf[size:]
+		switch c {
+		case '\n':
+			if l.termios.OEnabled(linux.ONLRET) || l.termios.OEnabled(linux.ONLCR) {
+				col = 0
+			}
+		case '\r':
+			if l.termios.OEnabled(linux.ONOCR) && col == 0 {
+				continue
+			}
+			if l.termios.OEnabled(linux.OCRNL) {
+				if l.termios.OEnabled(linux.ONLRET) {
+					col = 0
+				}
+				continue
+			}
+			col = 0
+		case '\t':
+			col += spacesPerTab - col%spacesPerTab
+		case '\b':
+			if col > 0 {
+				col--
+			}
+		default:
+			if !isControl(c) {
+				col++
+			}
+		}
+	}
+	return col
+}
+
+// syncCanonColumn records the current cursor column, including any buffered
+// echoes not yet written to outQueue, as the start column of the current
+// canonical line.
+//
+// +checklocksread:l.termiosMu
+// +checklocks:l.inQueue.mu
+// +checklocksexclude:l.outQueue.mu
+func (l *lineDiscipline) syncCanonColumn() {
+	l.outQueue.mu.Lock()
+	col := l.column
+	l.outQueue.mu.Unlock()
+	l.canonColumn = l.advanceColumn(col, l.echoBuf)
+}
+
+// eraseTab moves the cursor back to where an erased tab began, matching
+// Linux's n_tty.c:ECHO_OP_ERASE_TAB. line is the portion of the current
+// canonical line preceding the erased tab.
+//
+// +checklocksread:l.termiosMu
+// +checklocks:l.inQueue.mu
+func (l *lineDiscipline) eraseTab(line []byte) {
+	col := l.canonColumn
+	for _, c := range line {
+		if c == '\t' {
+			col += spacesPerTab - col%spacesPerTab
+		} else if isControl(c) {
+			if l.termios.LEnabled(linux.ECHOCTL) {
+				col += 2
+			}
+		} else if !l.termios.IEnabled(linux.IUTF8) || (c&0xc0) != 0x80 {
+			col++
+		}
+	}
+	spaces := spacesPerTab - col%spacesPerTab
+	for i := 0; i < spaces; i++ {
+		l.echo('\b')
+	}
 }
 
 // flushEchoes writes the echoes of the input processed so far to the output
