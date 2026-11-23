@@ -140,6 +140,12 @@ type lineDiscipline struct {
 	// +checklocks:termiosMu
 	packetStatus uint8
 
+	// lnext is whether the next character of input is queued as is, because
+	// the one before it was VLNEXT. See n_tty.c:n_tty_receive_char_lnext().
+	//
+	// +checklocks:inQueue.mu
+	lnext bool
+
 	// echoBuf holds the echoes of the input being processed. They are written
 	// to outQueue once the input has been processed, as
 	// n_tty.c:flush_echoes() does at the end of n_tty_receive_buf(), so that
@@ -235,6 +241,9 @@ func (l *lineDiscipline) setTermios2(task *kernel.Task, args arch.SyscallArgumen
 	// now readable.
 	if oldCanonEnabled && !l.termios.LEnabled(linux.ICANON) {
 		l.inQueue.mu.Lock()
+		// A VLNEXT applies only in canonical mode (see
+		// n_tty.c:n_tty_set_termios()).
+		l.lnext = false
 		l.inQueue.pushWaitBufLocked(l)
 		l.inQueue.readable = len(l.inQueue.readBuf) > 0
 		l.inQueue.mu.Unlock()
@@ -276,6 +285,9 @@ func (l *lineDiscipline) setTermios(task *kernel.Task, args arch.SyscallArgument
 	// now readable.
 	if oldCanonEnabled && !l.termios.LEnabled(linux.ICANON) {
 		l.inQueue.mu.Lock()
+		// A VLNEXT applies only in canonical mode (see
+		// n_tty.c:n_tty_set_termios()).
+		l.lnext = false
 		l.inQueue.pushWaitBufLocked(l)
 		l.inQueue.readable = len(l.inQueue.readBuf) > 0
 		l.inQueue.mu.Unlock()
@@ -628,6 +640,22 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 	for len(buf) > 0 && len(q.readBuf) < canonMaxBytes {
 		size := l.peek(buf)
 		cBytes := append([]byte{}, buf[:size]...)
+		if l.lnext {
+			// The character after VLNEXT is not special and never ends the
+			// line. Like any such character, it is discarded once the line
+			// is full (see shouldDiscard).
+			l.lnext = false
+			buf = buf[size:]
+			ret += size
+			if len(q.readBuf)+size >= canonMaxBytes {
+				continue
+			}
+			q.readBuf = append(q.readBuf, cBytes...)
+			if l.termios.LEnabled(linux.ECHO) {
+				l.echoChar(cBytes)
+			}
+			continue
+		}
 		// crToNL is whether cBytes is a carriage return that ICRNL turned
 		// into a newline.
 		crToNL := false
@@ -774,6 +802,34 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 			ret += 1
 			notifyEcho = true
 			continue
+
+		case l.termios.IsControlChar(c, linux.VLNEXT):
+			if !l.termios.LEnabled(linux.ICANON) || !l.termios.LEnabled(linux.IEXTEN) {
+				break
+			}
+			// The next character is queued as is (see l.lnext). With ECHO
+			// and ECHOCTL, "^" is shown in its place until it arrives.
+			l.lnext = true
+			if l.termios.LEnabled(linux.ECHO) && l.termios.LEnabled(linux.ECHOCTL) {
+				l.echo('^', '\b')
+			}
+			buf = buf[size:]
+			ret += size
+			continue
+
+		case l.termios.IsControlChar(c, linux.VREPRINT):
+			if !l.termios.LEnabled(linux.ICANON) || !l.termios.LEnabled(linux.IEXTEN) || !l.termios.LEnabled(linux.ECHO) {
+				break
+			}
+			// Echo the character, then the line typed so far on a new line.
+			l.echoChar(cBytes)
+			l.echo('\n')
+			for i := range q.readBuf {
+				l.echoChar(q.readBuf[i : i+1])
+			}
+			buf = buf[size:]
+			ret += size
+			continue
 		}
 
 		// In canonical mode, we discard non-terminating characters
@@ -802,6 +858,10 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 		// Anything written to the readBuf will have to be echoed.
 		if l.termios.LEnabled(linux.ECHO) {
 			l.echoInput(cBytes, crToNL)
+			notifyEcho = true
+		} else if cBytes[0] == '\n' && l.termios.LEnabled(linux.ICANON) && l.termios.LEnabled(linux.ECHONL) {
+			// With ECHONL, a line's newline is echoed even without ECHO.
+			l.echo('\n')
 			notifyEcho = true
 		}
 

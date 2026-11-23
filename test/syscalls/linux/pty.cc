@@ -2137,6 +2137,61 @@ TEST_F(PtyTest, EraseCharWithoutECHOE) {
   TestCanonicalIO("\n", "a\n", "\r\n");
 }
 
+// The character after VLNEXT is queued as is, even a signal character, as
+// n_tty.c:n_tty_receive_char_lnext() does. With ECHOCTL, "^\b" is echoed in
+// its place until it arrives.
+TEST_F(PtyTest, LiteralNextQueuesSignalChar) {
+  TestCanonicalIO("\x16\x03\n", "\x03\n", "^\b^C\r\n");
+}
+
+// VLNEXT applies to the next character even when it is written separately.
+TEST_F(PtyTest, LiteralNextAcrossWrites) {
+  WriteAll(master_, "\x16");
+  ExpectEcho(master_, "^\b");
+  TestCanonicalIO("\x03\n", "\x03\n", "^C\r\n");
+}
+
+// An erase character after VLNEXT is queued rather than erasing.
+TEST_F(PtyTest, LiteralNextQueuesEraseChar) {
+  TestCanonicalIO("a\x16\x7f\n", "a\x7f\n", "a^\b^?\r\n");
+}
+
+// A newline after VLNEXT does not end the line.
+TEST_F(PtyTest, LiteralNextNewlineDoesNotEndLine) {
+  WriteAll(master_, "a\x16\nb\n");
+  ExpectEcho(master_, "a^\b^Jb\r\n");
+  ASSERT_NO_ERRNO(WaitUntilReceived(replica_.get(), 4));
+  // One read returns the whole line. (ReadFd would read again for the rest
+  // of the buffer.)
+  char buf[8] = {};
+  ASSERT_THAT(RetryEINTR(read)(replica_.get(), buf, sizeof(buf)),
+              SyscallSucceedsWithValue(4));
+  EXPECT_STREQ(buf, "a\nb\n");
+}
+
+// VREPRINT echoes itself, a newline and the line typed so far.
+TEST_F(PtyTest, ReprintCharReprintsLine) {
+  WriteAll(master_, "a\x01");
+  ExpectEcho(master_, "a^A");
+  WriteAll(master_, "\x12");
+  ExpectEcho(master_, "^R\r\na^A");
+  TestCanonicalIO("\n", "a\x01\n", "\r\n");
+}
+
+// With ECHONL, a newline is echoed in canonical mode even without ECHO.
+TEST_F(PtyTest, EchoNLWithoutECHO) {
+  SetLocalFlags(replica_, ECHONL, ECHO);
+  TestCanonicalIO("ab\n", "ab\n", "\r\n");
+}
+
+// In noncanonical mode, VLNEXT and VREPRINT are ordinary characters.
+TEST_F(PtyTest, LiteralNextAndReprintCharInNoncanonicalMode) {
+  DisableCanonical();
+  WriteAll(master_, "\x16\x12");
+  ExpectEcho(master_, "^V^R");
+  ExpectReadExactly(replica_, "\x16\x12");
+}
+
 TEST_F(PtyTest, GetWindowSize) {
   struct winsize ws;
   ASSERT_THAT(ioctl(replica_.get(), TIOCGWINSZ, &ws), SyscallSucceeds());
