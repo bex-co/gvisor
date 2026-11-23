@@ -141,6 +141,13 @@ type lineDiscipline struct {
 	// +checklocks:inQueue.mu
 	canonColumn int
 
+	// erasing is whether ECHOPRT hardcopy erase echo is currently open (a
+	// leading '\' has been echoed and the closing '/' has not yet been echoed).
+	// See n_tty.c:n_tty_data.erasing.
+	//
+	// +checklocks:inQueue.mu
+	erasing bool
+
 	// stopped is whether output is stopped, as tty_struct.flow.stopped is on
 	// Linux (see stopOutput).
 	//
@@ -253,6 +260,7 @@ func (l *lineDiscipline) updateTermios(update func(*linux.KernelTermios)) {
 	// now readable. A VLNEXT applies only in canonical mode.
 	if old.LEnabled(linux.ICANON) && !l.termios.LEnabled(linux.ICANON) {
 		l.lnext = false
+		l.erasing = false
 		l.inQueue.lineEnds = nil
 		_, notifyMaster = l.inQueue.pushWaitBufLocked(l)
 		l.inQueue.readable = len(l.inQueue.readBuf) > 0
@@ -690,6 +698,7 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 				l.termios.LEnabled(linux.ECHOK) && l.termios.LEnabled(linux.ECHOKE) && l.termios.LEnabled(linux.ECHOE)) {
 				q.readBuf = q.readBuf[:canonHead]
 				if l.termios.LEnabled(linux.ECHO) {
+					l.finishErasing()
 					l.echoChar(cBytes)
 					if l.termios.LEnabled(linux.ECHOK) {
 						l.echo('\n')
@@ -721,10 +730,15 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 					}
 				}
 
+				erased := q.readBuf[len(q.readBuf)-cnt:]
 				q.readBuf = q.readBuf[:len(q.readBuf)-cnt]
 				if l.termios.LEnabled(linux.ECHO) {
 					if l.termios.LEnabled(linux.ECHOPRT) {
-						// Not implemented
+						if !l.erasing {
+							l.echo('\\')
+							l.erasing = true
+						}
+						l.echoChar(erased)
 					} else if killType == linux.VERASE && !l.termios.LEnabled(linux.ECHOE) {
 						// Without ECHOE, the erase character is echoed
 						// instead of erasing the character from the screen.
@@ -774,8 +788,11 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 			// The next character is queued as is (see l.lnext). With ECHO
 			// and ECHOCTL, "^" is shown in its place until it arrives.
 			l.lnext = true
-			if l.termios.LEnabled(linux.ECHO) && l.termios.LEnabled(linux.ECHOCTL) {
-				l.echo('^', '\b')
+			if l.termios.LEnabled(linux.ECHO) {
+				l.finishErasing()
+				if l.termios.LEnabled(linux.ECHOCTL) {
+					l.echo('^', '\b')
+				}
 			}
 			buf = buf[size:]
 			ret += size
@@ -786,6 +803,7 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 				break
 			}
 			// Echo the character, then the line typed so far on a new line.
+			l.finishErasing()
 			l.echoChar(cBytes)
 			l.echo('\n')
 			l.syncCanonColumn()
@@ -832,6 +850,9 @@ func (*inputQueueTransformer) transform(l *lineDiscipline, q *queue, buf []byte)
 
 		// Anything written to the readBuf will have to be echoed.
 		if l.termios.LEnabled(linux.ECHO) {
+			if !l.termios.LEnabled(linux.ICANON) || !l.termios.IsTerminating(cBytes) {
+				l.finishErasing()
+			}
 			l.echoInput(cBytes, crToNL)
 			notifyEcho = true
 		} else if cBytes[0] == '\n' && l.termios.LEnabled(linux.ICANON) && l.termios.LEnabled(linux.ECHONL) {
@@ -906,6 +927,7 @@ func (l *lineDiscipline) receiveSignalChar(cBytes []byte, sig linux.Signal) bool
 // +checklocksexclude:l.outQueue.mu
 func (l *lineDiscipline) flushForSignal() {
 	l.echoBuf = nil
+	l.erasing = false
 	l.inQueue.readBuf = l.inQueue.readBuf[:0]
 	l.inQueue.lineEnds = l.inQueue.lineEnds[:0]
 	l.inQueue.readable = false
@@ -995,6 +1017,17 @@ func mergePacketStatus(old, status uint8) uint8 {
 // +checklocks:l.inQueue.mu
 func (l *lineDiscipline) echo(b ...byte) {
 	l.echoBuf = append(l.echoBuf, b...)
+}
+
+// finishErasing closes an open ECHOPRT erase sequence by echoing '/'.
+// See n_tty.c:finish_erasing().
+//
+// +checklocks:l.inQueue.mu
+func (l *lineDiscipline) finishErasing() {
+	if l.erasing {
+		l.echo('/')
+		l.erasing = false
+	}
 }
 
 // advanceColumn returns the cursor column after buf is processed by the output
@@ -1271,6 +1304,12 @@ func (l *lineDiscipline) tcFlush(endpoint ptyEndpoint, arg uint32) error {
 	inputQueue := l.inputQueueForEndpoint(endpoint)
 	outputQueue := l.outputQueueForEndpoint(endpoint)
 	flushAndNotify := func(q *queue) {
+		if q == &l.inQueue {
+			l.inQueue.mu.Lock()
+			l.lnext = false
+			l.erasing = false
+			l.inQueue.mu.Unlock()
+		}
 		q.flush()
 		l.notifyWritableForFlushedQueue(q)
 	}

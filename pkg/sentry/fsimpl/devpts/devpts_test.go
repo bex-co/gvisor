@@ -238,6 +238,11 @@ func TestEcho(t *testing.T) {
 		{name: "erase tab after control char", input: "\x01\t\x7f\n", echo: "^A\t\b\b\b\b\b\b\r\n", read: "\x01\n"},
 		{name: "erase tab after control char without ECHOCTL", lflagsOff: linux.ECHOCTL, input: "\x01\t\x7f\n", echo: "\x01\t\b\b\b\b\b\b\b\b\r\n", read: "\x01\n"},
 		{name: "kill line containing tab", input: "a\tb\x15\n", echo: "a\tb\b \b\b\b\b\b\b\b\b\b \b\r\n", read: "\n"},
+		{name: "ECHOPRT erase and resume", lflagsOn: linux.ECHOPRT, input: "abc\x7f\x7fde\n", echo: "abc\\cb/de\r\n", read: "ade\n"},
+		{name: "ECHOPRT erase ctrl and tab", lflagsOn: linux.ECHOPRT, input: "a\x01\t\x7f\x7f\x7fx\n", echo: "a^A\t\\\t^Aa/x\r\n", read: "x\n"},
+		{name: "ECHOPRT vkill default", lflagsOn: linux.ECHOPRT, input: "abc\x15def\n", echo: "abc\\cba/def\r\n", read: "def\n"},
+		{name: "ECHOPRT erase then reprint", lflagsOn: linux.ECHOPRT, input: "abc\x7f\x12d\n", echo: "abc\\c/^R\r\nabd\r\n", read: "abd\n"},
+		{name: "ECHOPRT erase then newline", lflagsOn: linux.ECHOPRT, input: "ab\x7f\n", echo: "ab\\b\r\n", read: "a\n"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			termios := linux.DefaultReplicaTermios
